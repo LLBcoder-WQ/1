@@ -6,6 +6,8 @@ email-validator<3,>=2.2
 PyJWT[crypto]<3,>=2.10
 psycopg[binary]<4,>=3.2
 httpx<1,>=0.28
+python-multipart<1,>=0.0.20
 
 [dev]
+httpx<1,>=0.28
 pytest<9,>=8.3

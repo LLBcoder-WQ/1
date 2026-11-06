@@ -14,17 +14,11 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(20), default="customer")
+    display_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    avatar_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-
-class EmailLoginCode(Base):
-    __tablename__ = "email_login_codes"
-
-    email: Mapped[str] = mapped_column(String(255), primary_key=True)
-    code_hash: Mapped[str] = mapped_column(String(64))
-    expires_at: Mapped[datetime] = mapped_column(DateTime)
-    last_sent_at: Mapped[datetime] = mapped_column(DateTime)
-    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    store: Mapped["MerchantStore | None"] = relationship(back_populates="owner", cascade="all, delete-orphan")
 
 
 class Category(Base):
@@ -45,8 +39,30 @@ class Product(Base):
     price: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     stock: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    image_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    seller_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     category_id: Mapped[int | None] = mapped_column(ForeignKey("categories.id"), nullable=True)
     category: Mapped[Category | None] = relationship(back_populates="products")
+    seller: Mapped[User | None] = relationship()
+
+    @property
+    def store_name(self) -> str | None:
+        return self.seller.store.name if self.seller is not None and self.seller.store is not None else None
+
+    @property
+    def store_address(self) -> str | None:
+        return self.seller.store.address if self.seller is not None and self.seller.store is not None else None
+
+
+class MerchantStore(Base):
+    __tablename__ = "merchant_stores"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    address: Mapped[str] = mapped_column(String(300), default="")
+    description: Mapped[str] = mapped_column(String(1000), default="")
+    owner: Mapped[User] = relationship(back_populates="store")
 
 
 class CartItem(Base):

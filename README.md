@@ -1,6 +1,6 @@
 # 拾集商城
 
-这是一个用于学习的电商项目，包含 Vue 前端和 FastAPI 后端，提供邮箱验证码登录、商品与库存管理、购物车、订单、优惠码和演示支付等功能。
+这是一个用于学习的电商项目，包含 Vue 前端和 FastAPI 后端，提供顾客与商家账号、头像和商品图片上传、店铺资料、商品与库存管理、购物车、订单、优惠码和演示支付等功能。
 
 ## 本地运行
 
@@ -16,15 +16,27 @@ uvicorn app.main:app --reload
 
 默认数据库为 SQLite，文件名是 `shop.db`。需要时可通过环境变量配置 `SHOP_DATABASE_URL` 和 `SHOP_SECRET_KEY`。默认密钥仅用于本地开发，生产环境会拒绝使用默认密钥。
 
+## 账号与店铺功能
+
+注册时可以选择顾客或商家身份，使用邮箱和密码登录，不需要邮箱验证码。注册商家时需填写店铺名称；之后可以维护店铺名称、地址和介绍。
+
+登录后点击右上角账户图标，可以修改显示名称、上传头像、修改密码或注销账号。注销需要再次输入密码；订单记录保留并匿名化账户资料，商家的商品会下架。商家只能管理自己创建的商品；管理员仍可通过 `python -m app.seed_admin admin@example.com` 创建，并拥有管理权限。
+
+头像和商品图片使用 Supabase Storage 保存。上传支持 JPG、PNG 和 WebP，单张最大 5 MB。
+
 ## 主要接口
 
-- `POST /api/auth/email-code`：发送邮箱验证码
-- `POST /api/auth/email-code/verify`：验证邮箱验证码并登录
+- `POST /api/auth/register`、`POST /api/auth/login`：注册和邮箱密码登录
 - `GET /api/auth/me`：获取当前登录用户
-- `POST /api/auth/register`、`POST /api/auth/login`：旧版密码注册和登录接口
+- `PATCH /api/account/profile`、`POST /api/account/avatar`：更新账户资料和头像
+- `PATCH /api/account/password`、`DELETE /api/account`：修改密码和注销账户
+- `GET/PATCH /api/merchant/store`：查询和更新商家店铺信息
+- `GET /api/merchant/products`：查询自己的商品
+- `POST /api/products/{id}/image`：上传商品图片
 - `GET /api/categories`、`POST /api/categories`：查询和创建商品分类（创建需要管理员权限）
 - `GET /api/products`、`GET /api/products/{id}`：查询商品
-- `POST /api/products`、`PATCH /api/products/{id}`：创建和更新商品（需要管理员权限）
+- `POST /api/products`、`PATCH /api/products/{id}`：商家管理自己的商品，管理员可管理全部商品
+- `GET /api/merchant/products`：商家查询自己的商品，管理员查询全部商品
 - `GET /api/admin/products`：查询全部库存商品（需要管理员权限）
 - `GET /api/admin/orders`：查询最近订单，默认最多 50 条、上限 100 条，并包含买家邮箱（需要管理员权限）
 - `POST /api/admin/orders/{id}/shipment`：登记承运商和物流单号（需要管理员权限）
@@ -66,18 +78,17 @@ uvicorn app.main:app --reload
 
    命令会提示输入密码，输入内容不会显示。访问 `/health` 可检查 API 是否正常。应用首次启动时会自动创建缺失的表，并为旧订单表添加配送字段。
 
-仓库中的 Render Blueprint 使用免费方案，服务在闲置时可能休眠。Supabase 数据库独立于 Render 服务运行。请定期备份数据库并测试恢复流程；免费方案的可用性、连接数和备份保留规则以服务商当前政策为准。妥善保管 Supabase 数据库密码和 Render 密钥。演示支付不会收款，也不会确认付款。
+仓库中的 Render Blueprint 使用免费方案，服务在闲置时可能休眠。Supabase 数据库和 Storage 独立于 Render 服务运行。请定期备份数据库并测试恢复流程；免费方案的可用性、连接数和备份保留规则以服务商当前政策为准。妥善保管 Supabase 数据库密码和 Render 密钥。演示支付不会收款，也不会确认付款。
 
-### 使用 Resend 发送邮箱验证码
+### 配置 Supabase Storage 图片上传
 
-前端使用 6 位邮箱验证码登录。在 Resend 中创建 API Key，并验证一个你拥有的发件域名。然后在 Render 服务环境变量中设置以下变量（不要添加到 Vercel）：
+在 Supabase Storage 创建名为 `shop-images` 的 **Public bucket**（公开桶），用于头像和商品图片展示。然后在 Render 环境变量中设置：
 
-- `SHOP_RESEND_API_KEY`：Resend API Key。
-- `SHOP_EMAIL_FROM`：已验证域名下的发件地址，例如 `拾集 <login@mail.example.com>`。
+- `SHOP_SUPABASE_URL`：Supabase 项目 URL。
+- `SHOP_SUPABASE_SERVICE_ROLE_KEY`：Supabase 服务端密钥（仅保存在 Render，绝不放入 Vercel 或前端）。
+- `SHOP_SUPABASE_STORAGE_BUCKET`：Storage bucket 名称，默认为 `shop-images`。
 
-同一个邮箱每 60 秒最多发送一次验证码。验证码 10 分钟后过期，最多可尝试 5 次；数据库只保存带密钥的验证码哈希。首次验证成功会创建顾客账户；已有管理员账号也可以通过邮箱验证码登录，并保留管理员权限。设置好变量后，重新部署 Render。
-
-Resend 免费额度和发件人域名验证要求以 Resend 当前政策为准。
+图片上传由后端校验格式和大小后写入 Supabase Storage。设置变量并创建公开桶后，重新部署 Render。
 
 ## 可选：使用 Docker 部署
 

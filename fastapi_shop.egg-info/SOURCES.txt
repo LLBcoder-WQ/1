@@ -4,7 +4,6 @@ app/__init__.py
 app/config.py
 app/database.py
 app/dependencies.py
-app/email_auth.py
 app/main.py
 app/models.py
 app/payments.py
@@ -12,6 +11,7 @@ app/schemas.py
 app/security.py
 app/seed_admin.py
 app/seed_catalog.py
+app/storage.py
 fastapi_shop.egg-info/PKG-INFO
 fastapi_shop.egg-info/SOURCES.txt
 fastapi_shop.egg-info/dependency_links.txt

@@ -33,7 +33,7 @@ def get_current_user(
     except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
         raise unauthorized from None
     user = db.get(User, user_id)
-    if user is None:
+    if user is None or user.role == "deleted":
         raise unauthorized
     return user
 
@@ -41,4 +41,10 @@ def get_current_user(
 def require_admin(user: Annotated[User, Depends(get_current_user)]) -> User:
     if user.role != "admin":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+    return user
+
+
+def require_shop_manager(user: Annotated[User, Depends(get_current_user)]) -> User:
+    if user.role not in {"admin", "merchant"}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Shop manager access required")
     return user

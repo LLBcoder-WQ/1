@@ -51,6 +51,28 @@ def ensure_order_shipping_columns(target_engine: Engine = engine) -> None:
                 )
 
 
+def ensure_account_columns(target_engine: Engine = engine) -> None:
+    additions = {
+        "users": {
+            "display_name": "VARCHAR(100)",
+            "avatar_url": "VARCHAR(1000)",
+        },
+        "products": {
+            "image_url": "VARCHAR(1000)",
+            "seller_id": "INTEGER REFERENCES users(id) ON DELETE SET NULL",
+        },
+    }
+    with target_engine.begin() as connection:
+        inspector = inspect(connection)
+        for table_name, columns in additions.items():
+            existing = {column["name"] for column in inspector.get_columns(table_name)}
+            for column_name, column_type in columns.items():
+                if column_name not in existing:
+                    connection.execute(
+                        text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+                    )
+
+
 def get_db() -> Generator[Session, None, None]:
     with SessionLocal() as session:
         yield session

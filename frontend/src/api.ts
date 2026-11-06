@@ -1,7 +1,16 @@
 export interface User {
   id: number
   email: string
-  role: 'customer' | 'admin'
+  role: 'customer' | 'merchant' | 'admin'
+  display_name: string | null
+  avatar_url: string | null
+}
+
+export interface MerchantStore {
+  id: number
+  name: string
+  address: string
+  description: string
 }
 
 export interface Category {
@@ -18,6 +27,10 @@ export interface Product {
   stock: number
   is_active: boolean
   category_id: number | null
+  image_url: string | null
+  seller_id: number | null
+  store_name: string | null
+  store_address: string | null
 }
 
 export interface CartLine {
@@ -83,14 +96,31 @@ interface ApiOptions {
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/+$/, '')
 
+export class ApiError extends Error {
+  readonly status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
 export async function api<T>(path: string, options: ApiOptions = {}): Promise<T> {
+  const isFormData = options.body instanceof FormData
+  const body: BodyInit | undefined =
+    options.body === undefined
+      ? undefined
+      : options.body instanceof FormData
+        ? options.body
+        : JSON.stringify(options.body)
   const response = await fetch(`${API_BASE_URL}/api${path}`, {
     method: options.method ?? 'GET',
     headers: {
-      ...(options.body === undefined ? {} : { 'Content-Type': 'application/json' }),
+      ...(options.body === undefined || isFormData ? {} : { 'Content-Type': 'application/json' }),
       ...(options.token ? { Authorization: `Bearer ${options.token}` } : {}),
     },
-    ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
+    ...(body === undefined ? {} : { body }),
   })
 
   if (!response.ok) {
@@ -104,7 +134,7 @@ export async function api<T>(path: string, options: ApiOptions = {}): Promise<T>
     } catch {
       // Keep the HTTP status message when the server response isn't JSON.
     }
-    throw new Error(message)
+    throw new ApiError(message, response.status)
   }
 
   if (response.status === 204) return undefined as T

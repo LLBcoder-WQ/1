@@ -11,5 +11,7 @@ Requires-Dist: email-validator<3,>=2.2
 Requires-Dist: PyJWT[crypto]<3,>=2.10
 Requires-Dist: psycopg[binary]<4,>=3.2
 Requires-Dist: httpx<1,>=0.28
+Requires-Dist: python-multipart<1,>=0.0.20
 Provides-Extra: dev
+Requires-Dist: httpx<1,>=0.28; extra == "dev"
 Requires-Dist: pytest<9,>=8.3; extra == "dev"

@@ -15,7 +15,9 @@ services:
         sync: false
       - key: SHOP_CORS_ORIGINS
         sync: false
-      - key: SHOP_RESEND_API_KEY
+      - key: SHOP_SUPABASE_URL
         sync: false
-      - key: SHOP_EMAIL_FROM
+      - key: SHOP_SUPABASE_SERVICE_ROLE_KEY
         sync: false
+      - key: SHOP_SUPABASE_STORAGE_BUCKET
+        value: shop-images

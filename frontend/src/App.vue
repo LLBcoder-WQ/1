@@ -1,17 +1,20 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import {
+  ApiError,
   api,
   type AdminOrder,
   type Cart,
   type Category,
   type Coupon,
+  type MerchantStore,
   type Order,
   type Product,
   type User,
 } from './api'
 
 type View = 'shop' | 'orders' | 'admin'
+type AccountRole = 'customer' | 'merchant'
 const products = ref<Product[]>([])
 const inventoryProducts = ref<Product[]>([])
 const categories = ref<Category[]>([])
@@ -22,6 +25,7 @@ const orderFilter = ref<'all' | 'pending_payment' | 'paid' | 'processing' | 'shi
 const shipmentForms = ref<Record<number, { shipping_carrier: string; tracking_number: string }>>({})
 const coupons = ref<Coupon[]>([])
 const user = ref<User | null>(null)
+const merchantStore = ref<MerchantStore | null>(null)
 const token = ref(localStorage.getItem('shop-token') ?? '')
 const currentView = ref<View>('shop')
 const activeCategory = ref<number | null>(null)
@@ -30,8 +34,9 @@ const loading = ref(false)
 const busy = ref(false)
 const cartOpen = ref(false)
 const authOpen = ref(false)
-const emailCodeSent = ref(false)
-const emailCodeCountdown = ref(0)
+const accountOpen = ref(false)
+const authMode = ref<'login' | 'register'>('login')
+const authRole = ref<AccountRole>('customer')
 const toast = ref('')
 const error = ref('')
 const couponCode = ref('')
@@ -44,8 +49,13 @@ const shippingForm = ref({
   postal_code: '',
 })
 
-const authForm = ref({ email: '', code: '' })
-let emailCodeTimer: number | undefined
+const authForm = ref({ email: '', password: '', store_name: '' })
+const profileForm = ref({ display_name: '' })
+const passwordForm = ref({ current_password: '', new_password: '' })
+const deletePassword = ref('')
+const productImage = ref<File | null>(null)
+const editingProductId = ref<number | null>(null)
+const storeForm = ref({ name: '', address: '', description: '' })
 const productForm = ref({
   sku: '',
   name: '',
@@ -77,6 +87,8 @@ const filteredProducts = computed(() => {
   })
 })
 const isAdmin = computed(() => user.value?.role === 'admin')
+const isMerchant = computed(() => user.value?.role === 'merchant')
+const canManageShop = computed(() => isAdmin.value || isMerchant.value)
 const filteredAdminOrders = computed(() =>
   orderFilter.value === 'all'
     ? adminOrders.value
@@ -151,8 +163,19 @@ async function loadCoupons() {
 }
 
 async function loadInventory() {
-  if (isAdmin.value) {
-    inventoryProducts.value = await api<Product[]>('/admin/products', { token: token.value })
+  if (canManageShop.value) {
+    inventoryProducts.value = await api<Product[]>('/merchant/products', { token: token.value })
+  }
+}
+
+async function loadMerchantStore() {
+  if (isMerchant.value) {
+    merchantStore.value = await api<MerchantStore>('/merchant/store', { token: token.value })
+    storeForm.value = {
+      name: merchantStore.value.name,
+      address: merchantStore.value.address,
+      description: merchantStore.value.description,
+    }
   }
 }
 
@@ -194,43 +217,53 @@ function scrollToCollection() {
   document.getElementById('collection')?.scrollIntoView({ behavior: 'smooth' })
 }
 
-function openAuth() {
+function openAuth(mode: 'login' | 'register' = 'login') {
+  authMode.value = mode
   authOpen.value = true
 }
 
-async function requestEmailCode() {
-  busy.value = true
-  try {
-    authForm.value.email = authForm.value.email.trim().toLowerCase()
-    await api<{ detail: string }>('/auth/email-code', {
-      method: 'POST',
-      body: { email: authForm.value.email },
-    })
-    emailCodeSent.value = true
-    emailCodeCountdown.value = 60
-    notify('验证码已发送，请查看邮箱')
-  } catch (reason) {
-    showError(reason instanceof Error ? reason.message : '验证码发送失败，请稍后重试')
-  } finally {
-    busy.value = false
+function openAccount() {
+  if (!user.value) {
+    openAuth()
+    return
   }
+  profileForm.value.display_name = user.value.display_name ?? ''
+  passwordForm.value = { current_password: '', new_password: '' }
+  deletePassword.value = ''
+  accountOpen.value = true
 }
 
 async function submitAuth() {
   busy.value = true
   try {
-    const result = await api<{ access_token: string }>('/auth/email-code/verify', {
+    authForm.value.email = authForm.value.email.trim().toLowerCase()
+    if (authMode.value === 'register') {
+      await api<User>('/auth/register', {
+        method: 'POST',
+        body: {
+          email: authForm.value.email,
+          password: authForm.value.password,
+          role: authRole.value,
+          ...(authRole.value === 'merchant' ? { store_name: authForm.value.store_name.trim() } : {}),
+        },
+      })
+    }
+    const result = await api<{ access_token: string }>('/auth/login', {
       method: 'POST',
-      body: { email: authForm.value.email, code: authForm.value.code },
+      body: {
+        email: authForm.value.email,
+        password: authForm.value.password,
+        role: authRole.value,
+      },
     })
     token.value = result.access_token
     localStorage.setItem('shop-token', token.value)
     user.value = await api<User>('/auth/me', { token: token.value })
     authOpen.value = false
-    authForm.value.code = ''
-    emailCodeSent.value = false
+    authForm.value.password = ''
     await loadCart()
-    if (isAdmin.value) await Promise.all([loadCoupons(), loadInventory(), loadAdminOrders()])
+    if (canManageShop.value) await Promise.all([loadInventory(), loadMerchantStore()])
+    if (isAdmin.value) await Promise.all([loadCoupons(), loadAdminOrders()])
     notify(`欢迎回来，${user.value.email}`)
   } catch (reason) {
     showError(reason instanceof Error ? reason.message : '登录失败，请稍后重试')
@@ -244,11 +277,16 @@ async function restoreSession() {
   try {
     user.value = await api<User>('/auth/me', { token: token.value })
     await loadCart()
-    if (isAdmin.value) await Promise.all([loadCoupons(), loadInventory(), loadAdminOrders()])
-  } catch {
-    token.value = ''
-    user.value = null
-    localStorage.removeItem('shop-token')
+    if (canManageShop.value) await Promise.all([loadInventory(), loadMerchantStore()])
+    if (isAdmin.value) await Promise.all([loadCoupons(), loadAdminOrders()])
+  } catch (reason) {
+    if (reason instanceof ApiError && reason.status === 401) {
+      token.value = ''
+      user.value = null
+      localStorage.removeItem('shop-token')
+      return
+    }
+    showError(reason instanceof Error ? reason.message : '无法恢复登录状态，请稍后重试')
   }
 }
 
@@ -257,6 +295,7 @@ function signOut() {
   user.value = null
   cart.value = { items: [], subtotal: '0.00' }
   orders.value = []
+  merchantStore.value = null
   coupons.value = []
   adminOrders.value = []
   localStorage.removeItem('shop-token')
@@ -264,9 +303,71 @@ function signOut() {
   notify('已安全退出')
 }
 
-function changeAuthEmail() {
-  emailCodeSent.value = false
-  authForm.value.code = ''
+async function saveProfile() {
+  try {
+    user.value = await api<User>('/account/profile', {
+      method: 'PATCH',
+      token: token.value,
+      body: { display_name: profileForm.value.display_name },
+    })
+    notify('账户资料已保存')
+  } catch (reason) {
+    showError(reason instanceof Error ? reason.message : '资料保存失败')
+  }
+}
+
+async function uploadAvatar(event: Event) {
+  const file = (event.target as HTMLInputElement).files?.[0]
+  if (!file) return
+  const form = new FormData()
+  form.append('image', file)
+  try {
+    user.value = await api<User>('/account/avatar', {
+      method: 'POST',
+      token: token.value,
+      body: form,
+    })
+    notify('头像已更新')
+  } catch (reason) {
+    showError(reason instanceof Error ? reason.message : '头像上传失败')
+  } finally {
+    ;(event.target as HTMLInputElement).value = ''
+  }
+}
+
+async function changePassword() {
+  try {
+    await api<void>('/account/password', {
+      method: 'PATCH',
+      token: token.value,
+      body: passwordForm.value,
+    })
+    passwordForm.value = { current_password: '', new_password: '' }
+    notify('密码已修改')
+  } catch (reason) {
+    showError(reason instanceof Error ? reason.message : '密码修改失败')
+  }
+}
+
+async function deleteAccount() {
+  if (!window.confirm('确定注销账户吗？订单将保留并匿名化，商家商品会下架。此操作不能撤销。')) return
+  try {
+    await api<void>('/account', {
+      method: 'DELETE',
+      token: token.value,
+      body: { password: deletePassword.value },
+    })
+    accountOpen.value = false
+    signOut()
+    notify('账户已注销，历史订单已匿名保留')
+  } catch (reason) {
+    showError(reason instanceof Error ? reason.message : '账户注销失败')
+  }
+}
+
+function selectProductImage(event: Event) {
+  const file = (event.target as HTMLInputElement).files?.[0] ?? null
+  productImage.value = file
 }
 
 async function addToCart(product: Product) {
@@ -372,23 +473,77 @@ async function startPayment(order: Order) {
 async function createProduct() {
   busy.value = true
   try {
-    await api<Product>('/products', {
-      method: 'POST',
+    const body = {
+      ...productForm.value,
+      price: Number(productForm.value.price),
+      stock: Number(productForm.value.stock),
+      category_id: productForm.value.category_id ? Number(productForm.value.category_id) : null,
+    }
+    const created = await api<Product>(
+      editingProductId.value ? `/products/${editingProductId.value}` : '/products',
+      {
+      method: editingProductId.value ? 'PATCH' : 'POST',
       token: token.value,
-      body: {
-        ...productForm.value,
-        price: Number(productForm.value.price),
-        stock: Number(productForm.value.stock),
-        category_id: productForm.value.category_id ? Number(productForm.value.category_id) : null,
+      body,
       },
-    })
+    )
+    const image = productImage.value
     productForm.value = { sku: '', name: '', description: '', price: '', stock: '', category_id: '' }
+    productImage.value = null
+    editingProductId.value = null
+    const imageInput = document.getElementById('product-image') as HTMLInputElement | null
+    if (imageInput) imageInput.value = ''
+    if (image) {
+      const form = new FormData()
+      form.append('image', image)
+      await api<Product>(`/products/${created.id}/image`, {
+        method: 'POST',
+        token: token.value,
+        body: form,
+      })
+    }
     await Promise.all([loadStore(), loadInventory()])
-    notify('商品已发布')
+    notify(image ? '商品和图片已保存' : '商品信息已保存')
   } catch (reason) {
-    showError(reason instanceof Error ? reason.message : '商品创建失败')
+    await loadInventory()
+    showError(reason instanceof Error ? `商品保存或图片上传失败：${reason.message}` : '商品保存失败')
   } finally {
     busy.value = false
+  }
+}
+
+function editProduct(product: Product) {
+  editingProductId.value = product.id
+  productForm.value = {
+    sku: product.sku,
+    name: product.name,
+    description: product.description,
+    price: product.price,
+    stock: String(product.stock),
+    category_id: product.category_id === null ? '' : String(product.category_id),
+  }
+  productImage.value = null
+  document.getElementById('product-image')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
+
+function cancelProductEdit() {
+  editingProductId.value = null
+  productForm.value = { sku: '', name: '', description: '', price: '', stock: '', category_id: '' }
+  productImage.value = null
+  const imageInput = document.getElementById('product-image') as HTMLInputElement | null
+  if (imageInput) imageInput.value = ''
+}
+
+async function saveMerchantStore() {
+  try {
+    merchantStore.value = await api<MerchantStore>('/merchant/store', {
+      method: 'PATCH',
+      token: token.value,
+      body: storeForm.value,
+    })
+    notify('店铺资料已保存')
+  } catch (reason) {
+    showError(reason instanceof Error ? reason.message : '店铺资料保存失败')
   }
 }
 
@@ -457,12 +612,13 @@ async function changeView(view: View) {
       showError(reason instanceof Error ? reason.message : '订单加载失败')
     }
   }
-  if (view === 'admin' && !isAdmin.value) {
+  if (view === 'admin' && !canManageShop.value) {
     currentView.value = 'shop'
-    showError('该区域仅管理员可访问')
+    showError('该区域仅商家或管理员可访问')
   } else if (view === 'admin') {
     try {
-      await Promise.all([loadInventory(), loadCoupons(), loadAdminOrders()])
+      await Promise.all([loadInventory(), loadMerchantStore()])
+      if (isAdmin.value) await Promise.all([loadCoupons(), loadAdminOrders()])
     } catch (reason) {
       showError(reason instanceof Error ? reason.message : '管理数据加载失败')
     }
@@ -478,14 +634,7 @@ function categoryNameOf(id: number | null) {
 }
 
 onMounted(async () => {
-  emailCodeTimer = window.setInterval(() => {
-    if (emailCodeCountdown.value > 0) emailCodeCountdown.value -= 1
-  }, 1000)
   await Promise.all([loadStore(), restoreSession()])
-})
-
-onUnmounted(() => {
-  if (emailCodeTimer !== undefined) window.clearInterval(emailCodeTimer)
 })
 </script>
 
@@ -507,8 +656,8 @@ onUnmounted(() => {
         <button v-if="user" :class="{ selected: currentView === 'orders' }" @click="changeView('orders')">
           我的订单
         </button>
-        <button v-if="isAdmin" :class="{ selected: currentView === 'admin' }" @click="changeView('admin')">
-          店铺管理
+        <button v-if="canManageShop" :class="{ selected: currentView === 'admin' }" @click="changeView('admin')">
+          {{ isAdmin ? '平台管理' : '店铺管理' }}
         </button>
       </nav>
       <div class="header-actions">
@@ -517,9 +666,10 @@ onUnmounted(() => {
           <input v-model="search" placeholder="搜索好物" aria-label="搜索商品" @focus="changeView('shop')" />
           <kbd>⌘ K</kbd>
         </label>
-        <button class="icon-button account-button" :aria-label="user ? '退出登录' : '登录'" @click="user ? signOut() : openAuth()">
+        <button class="icon-button account-button" :aria-label="user ? '账户管理' : '登录'" @click="user ? openAccount() : openAuth()">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3.5" /><path d="M4.5 20c.7-3.5 3.2-5.3 7.5-5.3s6.8 1.8 7.5 5.3" /></svg>
-          <span v-if="user" class="user-initial">{{ user.email[0]?.toUpperCase() }}</span>
+          <img v-if="user?.avatar_url" class="user-initial-avatar" :src="user.avatar_url" alt="" />
+          <span v-else-if="user" class="user-initial">{{ (user.display_name || user.email)[0]?.toUpperCase() }}</span>
         </button>
         <button class="icon-button bag-button" aria-label="打开购物袋" @click="user ? (cartOpen = true) : openAuth()">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 8h14l1 12H4L5 8Z" /><path d="M9 9V6a3 3 0 0 1 6 0v3" /></svg>
@@ -589,7 +739,8 @@ onUnmounted(() => {
             <article v-for="(product, index) in filteredProducts" :key="product.id" class="product-card">
               <div class="product-visual" :class="productTone(index)">
                 <span class="product-category">{{ categoryNameOf(product.category_id) }}</span>
-                <div class="product-object" aria-hidden="true">
+                <img v-if="product.image_url" class="product-image" :src="product.image_url" :alt="product.name" />
+                <div v-else class="product-object" aria-hidden="true">
                   <span class="object-shadow"></span>
                   <span class="object-shape" :class="`object-${index % 6}`"></span>
                   <span class="object-detail"></span>
@@ -609,14 +760,15 @@ onUnmounted(() => {
                 <div><h3>{{ product.name }}</h3><span class="product-sku">NO. {{ product.sku }}</span></div>
                 <span class="product-price">{{ money(product.price) }}</span>
                 <p>{{ product.description || '为日常而选，简约而不简单。' }}</p>
+                <small v-if="product.store_name" class="product-store">{{ product.store_name }}<template v-if="product.store_address"> · {{ product.store_address }}</template></small>
               </div>
             </article>
           </div>
           <div v-else class="empty-state">
             <span class="empty-flower">✳</span>
             <h3>{{ search || activeCategory ? '没有找到合适的好物' : '新一批好物，正在路上。' }}</h3>
-            <p>{{ isAdmin ? '先到店铺管理发布商品，精选好物就会出现在这里。' : '店铺正在认真准备第一批精选，稍后再来看看吧。' }}</p>
-            <button v-if="isAdmin" class="button button-outline" @click="changeView('admin')">去发布商品 <span>↗</span></button>
+            <p>{{ canManageShop ? '先到店铺管理发布商品，精选好物就会出现在这里。' : '店铺正在认真准备第一批精选，稍后再来看看吧。' }}</p>
+            <button v-if="canManageShop" class="button button-outline" @click="changeView('admin')">去发布商品 <span>↗</span></button>
             <button v-else-if="search || activeCategory" class="text-button" @click="search = ''; activeCategory = null">查看全部好物 ↗</button>
           </div>
         </section>
@@ -646,19 +798,35 @@ onUnmounted(() => {
 
       <section v-if="currentView === 'admin'" class="page-section admin-page">
         <div class="page-kicker">STUDIO DESK &nbsp; / &nbsp; 01</div>
-        <div class="page-title-row"><div><div class="eyebrow"><span class="eyebrow-line"></span> STORE MANAGEMENT</div><h1>店铺管理<span class="title-period">.</span></h1></div><p>把好物，一件件认真呈现。</p></div>
-        <div class="admin-stats">        <div><span>在售商品</span><b>{{ inventoryProducts.filter((product) => product.is_active).length.toString().padStart(2, '0') }}</b></div><div><span>商品分类</span><b>{{ categories.length.toString().padStart(2, '0') }}</b></div><div><span>优惠码</span><b>{{ coupons.length.toString().padStart(2, '0') }}</b></div></div>
-        <div class="admin-grid">
+        <div class="page-title-row"><div><div class="eyebrow"><span class="eyebrow-line"></span> STORE MANAGEMENT</div><h1>{{ isAdmin ? '平台管理' : '店铺管理' }}<span class="title-period">.</span></h1></div><p>把好物，一件件认真呈现。</p></div>
+        <div v-if="isMerchant" class="merchant-store-card">
+          <div class="inventory-heading"><div><span class="eyebrow">YOUR STORE</span><h2>店铺资料</h2></div></div>
+          <form class="store-profile-form" @submit.prevent="saveMerchantStore">
+            <label>店铺名称<input v-model="storeForm.name" required maxlength="120" /></label>
+            <label>店铺地址<input v-model="storeForm.address" maxlength="300" placeholder="填写城市和详细地址" /></label>
+            <label>店铺介绍<textarea v-model="storeForm.description" maxlength="1000" rows="2" placeholder="介绍一下你的店铺…" /></label>
+            <button class="button button-outline" type="submit">保存店铺资料</button>
+          </form>
+        </div>
+        <div class="admin-stats" :class="{ 'merchant-stats': !isAdmin }">
+          <div><span>在售商品</span><b>{{ inventoryProducts.filter((product) => product.is_active).length.toString().padStart(2, '0') }}</b></div>
+          <div v-if="isAdmin"><span>商品分类</span><b>{{ categories.length.toString().padStart(2, '0') }}</b></div>
+          <div v-if="isAdmin"><span>优惠码</span><b>{{ coupons.length.toString().padStart(2, '0') }}</b></div>
+          <div v-else><span>账号身份</span><b>商家</b></div>
+        </div>
+        <div class="admin-grid" :class="{ 'merchant-grid': !isAdmin }">
           <form class="admin-card product-form" @submit.prevent="createProduct">
-            <div class="admin-card-head"><div><span class="eyebrow">01 / CATALOG</span><h2>上架新商品</h2></div><span class="admin-card-icon">＋</span></div>
+            <div class="admin-card-head"><div><span class="eyebrow">01 / CATALOG</span><h2>{{ editingProductId ? '编辑商品' : '上架新商品' }}</h2></div><span class="admin-card-icon">＋</span></div>
             <label>商品名称<input v-model="productForm.name" required maxlength="200" placeholder="比如：手作陶土花瓶" /></label>
             <div class="form-pair"><label>商品编号<input v-model="productForm.sku" required maxlength="64" placeholder="SH-001" /></label><label>分类<select v-model="productForm.category_id"><option value="">未分类</option><option v-for="category in categories" :key="category.id" :value="String(category.id)">{{ category.name }}</option></select></label></div>
             <div class="form-pair"><label>售价（元）<input v-model="productForm.price" type="number" min="0.01" step="0.01" required placeholder="128.00" /></label><label>库存<input v-model="productForm.stock" type="number" min="0" step="1" required placeholder="20" /></label></div>
             <label>一句介绍<textarea v-model="productForm.description" maxlength="2000" rows="3" placeholder="写下这件好物的特别之处…" /></label>
-            <button class="button button-dark form-submit" :disabled="busy">发布商品 <span>↗</span></button>
+            <label>商品图片（JPG、PNG、WebP，最大 5 MB）<input id="product-image" type="file" accept="image/jpeg,image/png,image/webp" @change="selectProductImage" /></label>
+            <button class="button button-dark form-submit" :disabled="busy">{{ editingProductId ? '保存商品修改' : '发布商品' }} <span>↗</span></button>
+            <button v-if="editingProductId" class="button button-outline form-submit" type="button" @click="cancelProductEdit">取消编辑</button>
           </form>
 
-          <div class="admin-side">
+          <div v-if="isAdmin" class="admin-side">
             <form class="admin-card compact-form" @submit.prevent="createCategory">
               <div class="admin-card-head"><div><span class="eyebrow">02 / ORGANIZE</span><h2>商品分类</h2></div><span class="admin-card-icon">⌘</span></div>
               <div class="inline-form"><input v-model="categoryName" required maxlength="100" placeholder="新增一个分类…" /><button class="button button-dark" aria-label="创建分类">+</button></div>
@@ -681,18 +849,18 @@ onUnmounted(() => {
           <div v-else class="inventory-table">
             <div class="inventory-row inventory-labels"><span>商品</span><span>分类</span><span>价格</span><span>库存</span><span>状态</span><span>管理</span></div>
             <div v-for="product in inventoryProducts" :key="product.id" class="inventory-row">
-              <span class="inventory-product"><i>{{ product.name[0] }}</i><b>{{ product.name }}<small>{{ product.sku }}</small></b></span>
+              <span class="inventory-product"><img v-if="product.image_url" :src="product.image_url" :alt="product.name" /><i v-else>{{ product.name[0] }}</i><b>{{ product.name }}<small>{{ product.sku }}</small></b></span>
               <span>{{ categoryNameOf(product.category_id) }}</span><span>{{ money(product.price) }}</span><span>{{ product.stock }} 件</span>
               <span><i class="live-dot" :class="{ offline: !product.is_active }"></i>{{ product.is_active ? '在售' : '已下架' }}</span>
-              <button class="text-button" @click="toggleProduct(product)">{{ product.is_active ? '下架' : '重新上架' }}</button>
+              <span class="inventory-actions"><button class="text-button" @click="editProduct(product)">编辑</button><button class="text-button" @click="toggleProduct(product)">{{ product.is_active ? '下架' : '重新上架' }}</button></span>
             </div>
           </div>
-          <div class="coupon-list">
+          <div v-if="isAdmin" class="coupon-list">
             <div class="inventory-heading"><div><span class="eyebrow">05 / COUPON BOOK</span><h2>正在使用的优惠码</h2></div></div>
             <div v-if="!coupons.length" class="inventory-empty">还没有优惠码。</div>
             <div v-else class="coupon-list-grid"><div v-for="coupon in coupons" :key="coupon.id" class="coupon-chip"><span>{{ coupon.code }}</span><b>{{ coupon.discount_type === 'percent' ? `${coupon.value}% OFF` : `${money(coupon.value)} OFF` }}</b><small>已使用 {{ coupon.uses_count }}{{ coupon.max_uses ? ` / ${coupon.max_uses}` : '' }}</small></div></div>
           </div>
-          <div class="admin-orders">
+          <div v-if="isAdmin" class="admin-orders">
             <div class="inventory-heading">
               <div><span class="eyebrow">06 / CUSTOMER ORDERS</span><h2>顾客订单</h2></div>
               <div class="order-filters" aria-label="筛选订单">
@@ -781,20 +949,49 @@ onUnmounted(() => {
 
     <Transition name="fade">
       <div v-if="authOpen" class="overlay auth-overlay" @click.self="authOpen = false">
-        <section class="auth-card" aria-label="账户登录">
+        <section class="auth-card" aria-label="账户登录注册">
           <button class="close-button auth-close" aria-label="关闭登录窗口" @click="authOpen = false">×</button>
           <div class="auth-mark">拾</div><div class="eyebrow"><span class="eyebrow-line"></span> A PLACE FOR YOUR FINDS</div>
-          <h2>邮箱验证码登录。</h2><p>输入邮箱获取验证码，无需设置密码。首次验证后会自动创建账户。</p>
+          <h2>{{ authMode === 'login' ? (authRole === 'merchant' ? '商家登录。' : '欢迎回来。') : '创建账户。' }}</h2>
+          <p>{{ authMode === 'login' ? '使用邮箱和密码登录拾集。' : '选择账户身份，开始使用拾集。' }}</p>
+          <div class="auth-role-tabs">
+            <button type="button" :class="{ active: authRole === 'customer' }" @click="authRole = 'customer'">顾客</button>
+            <button type="button" :class="{ active: authRole === 'merchant' }" @click="authRole = 'merchant'">商家</button>
+          </div>
           <form @submit.prevent="submitAuth">
-            <label>邮箱地址<input v-model="authForm.email" type="email" autocomplete="email" required maxlength="255" :readonly="emailCodeSent" placeholder="hello@example.com" /></label>
-            <template v-if="emailCodeSent">
-              <label>邮箱验证码<input v-model="authForm.code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required placeholder="输入 6 位验证码" /></label>
-              <div class="auth-code-actions"><button class="text-button" type="button" :disabled="busy || emailCodeCountdown > 0" @click="requestEmailCode">{{ emailCodeCountdown > 0 ? `${emailCodeCountdown} 秒后重新发送` : '重新发送验证码' }}</button><button class="text-button" type="button" @click="changeAuthEmail">修改邮箱</button></div>
-              <button class="button button-dark auth-submit" :disabled="busy">验证并登录 <span>↗</span></button>
-            </template>
-            <button v-else class="button button-dark auth-submit" type="button" :disabled="busy || !authForm.email">发送验证码 <span>↗</span></button>
+            <label>邮箱地址<input v-model="authForm.email" type="email" autocomplete="email" required maxlength="255" placeholder="hello@example.com" /></label>
+            <label>密码<input v-model="authForm.password" type="password" :autocomplete="authMode === 'login' ? 'current-password' : 'new-password'" minlength="8" maxlength="128" required placeholder="至少 8 位" /></label>
+            <label v-if="authMode === 'register' && authRole === 'merchant'">店铺名称<input v-model="authForm.store_name" required maxlength="120" placeholder="输入你的店铺名称" /></label>
+            <button class="button button-dark auth-submit" :disabled="busy">{{ authMode === 'login' ? '登录' : '注册并登录' }} <span>↗</span></button>
           </form>
-          <p class="auth-admin-note">管理员账号请先通过后端 seed_admin 命令创建</p>
+          <p class="auth-switch">{{ authMode === 'login' ? '还没有账户？' : '已有账户？' }} <button type="button" @click="authMode = authMode === 'login' ? 'register' : 'login'">{{ authMode === 'login' ? '注册' : '返回登录' }}</button></p>
+          <p class="auth-admin-note">管理员账号由店铺管理员创建，请使用顾客入口登录</p>
+        </section>
+      </div>
+    </Transition>
+
+    <Transition name="fade">
+      <div v-if="accountOpen && user" class="overlay auth-overlay" @click.self="accountOpen = false">
+        <section class="auth-card account-card" aria-label="账户管理">
+          <button class="close-button auth-close" aria-label="关闭账户管理" @click="accountOpen = false">×</button>
+          <div class="auth-mark">拾</div><div class="eyebrow"><span class="eyebrow-line"></span> ACCOUNT SETTINGS</div>
+          <h2>账户管理。</h2><p>{{ user.email }} · {{ user.role === 'merchant' ? '商家' : user.role === 'admin' ? '管理员' : '顾客' }}</p>
+          <label>头像<input type="file" accept="image/jpeg,image/png,image/webp" @change="uploadAvatar" /></label>
+          <div v-if="user.avatar_url" class="account-avatar-preview"><img :src="user.avatar_url" alt="当前头像" /></div>
+          <form @submit.prevent="saveProfile">
+            <label>显示名称<input v-model="profileForm.display_name" maxlength="100" placeholder="设置你的昵称" /></label>
+            <button class="button button-outline auth-submit" type="submit">保存资料</button>
+          </form>
+          <form class="account-password-form" @submit.prevent="changePassword">
+            <label>当前密码<input v-model="passwordForm.current_password" type="password" autocomplete="current-password" required /></label>
+            <label>新密码<input v-model="passwordForm.new_password" type="password" autocomplete="new-password" minlength="8" maxlength="128" required /></label>
+            <button class="button button-dark auth-submit" type="submit">修改密码</button>
+          </form>
+          <form v-if="user.role !== 'admin'" class="account-delete-form" @submit.prevent="deleteAccount">
+            <label>输入密码以注销账户<input v-model="deletePassword" type="password" autocomplete="current-password" required /></label>
+            <button class="text-button danger-button" type="submit">注销账户</button>
+          </form>
+          <button class="button button-outline auth-submit" type="button" @click="accountOpen = false; signOut()">退出登录</button>
         </section>
       </div>
     </Transition>

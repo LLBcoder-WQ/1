@@ -4,10 +4,12 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlalchemy import create_engine, inspect, text
 
-from app.database import Base, ensure_order_shipping_columns, get_db
+from app.config import Settings
+from app.database import Base, ensure_account_columns, ensure_order_shipping_columns, get_db
 from app.main import app
 from app.models import Order, User
 from app.security import hash_password
+from app.storage import MAX_IMAGE_SIZE, upload_public_image
 
 
 @pytest.fixture
@@ -40,8 +42,16 @@ def client():
     test_engine.dispose()
 
 
-def auth(client: TestClient, email: str, password: str) -> dict[str, str]:
-    response = client.post("/api/auth/login", json={"email": email, "password": password})
+def auth(
+    client: TestClient,
+    email: str,
+    password: str,
+    role: str = "customer",
+) -> dict[str, str]:
+    response = client.post(
+        "/api/auth/login",
+        json={"email": email, "password": password, "role": role},
+    )
     assert response.status_code == 200
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
 
@@ -278,6 +288,22 @@ def test_legacy_orders_table_gets_shipping_columns_idempotently():
         legacy_engine.dispose()
 
 
+def test_legacy_account_columns_are_added_idempotently():
+    legacy_engine = create_engine("sqlite://")
+    try:
+        with legacy_engine.begin() as connection:
+            connection.execute(text("CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR(255))"))
+            connection.execute(text("CREATE TABLE products (id INTEGER PRIMARY KEY, sku VARCHAR(64))"))
+        ensure_account_columns(legacy_engine)
+        ensure_account_columns(legacy_engine)
+        user_columns = {column["name"] for column in inspect(legacy_engine).get_columns("users")}
+        product_columns = {column["name"] for column in inspect(legacy_engine).get_columns("products")}
+        assert {"display_name", "avatar_url"}.issubset(user_columns)
+        assert {"image_url", "seller_id"}.issubset(product_columns)
+    finally:
+        legacy_engine.dispose()
+
+
 def test_shipping_is_blocked_until_payment_and_tracking_is_visible_to_customer(client: TestClient):
     admin = auth(client, "admin@example.com", "admin-password")
     buyer = auth(client, "buyer@example.com", "buyer-password")
@@ -345,118 +371,206 @@ def test_shipment_details_cannot_be_blank(client: TestClient):
     assert response.status_code == 422
 
 
-def test_email_code_creates_customer_and_is_one_time(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    sent: list[tuple[str, str]] = []
+def test_customer_and_merchant_registration_and_role_login(client: TestClient):
+    customer = client.post(
+        "/api/auth/register",
+        json={"email": "new.customer@example.com", "password": "customer-password"},
+    )
+    assert customer.status_code == 201
+    assert customer.json()["role"] == "customer"
+
+    missing_store = client.post(
+        "/api/auth/register",
+        json={"email": "no-store@example.com", "password": "merchant-password", "role": "merchant"},
+    )
+    assert missing_store.status_code == 422
+    merchant = client.post(
+        "/api/auth/register",
+        json={
+            "email": "merchant@example.com",
+            "password": "merchant-password",
+            "role": "merchant",
+            "store_name": "Sample",
+        },
+    )
+    assert merchant.status_code == 201
+    assert merchant.json()["role"] == "merchant"
+    assert client.post(
+        "/api/auth/login",
+        json={"email": "merchant@example.com", "password": "merchant-password"},
+    ).status_code == 403
+    merchant_headers = auth(client, "merchant@example.com", "merchant-password", "merchant")
+    assert client.get("/api/merchant/store", headers=merchant_headers).json()["name"] == "Sample"
+
+
+def test_merchants_manage_only_their_own_products_and_store(client: TestClient):
+    for email, store_name in (("first-merchant@example.com", "Sample"), ("second-merchant@example.com", "Sample")):
+        response = client.post(
+            "/api/auth/register",
+            json={"email": email, "password": "merchant-password", "role": "merchant", "store_name": store_name},
+        )
+        assert response.status_code == 201
+    first_headers = auth(client, "first-merchant@example.com", "merchant-password", "merchant")
+    second_headers = auth(client, "second-merchant@example.com", "merchant-password", "merchant")
+    product = client.post(
+        "/api/products",
+        json={"sku": "MERCHANT-1", "name": "Sample", "price": "12.00", "stock": 5},
+        headers=first_headers,
+    )
+    assert product.status_code == 201
+    assert product.json()["store_name"] == "Sample"
+    assert [item["id"] for item in client.get("/api/merchant/products", headers=first_headers).json()] == [product.json()["id"]]
+    assert client.get("/api/merchant/products", headers=second_headers).json() == []
+    assert client.patch(
+        f"/api/products/{product.json()['id']}", json={"stock": 20}, headers=second_headers
+    ).status_code == 404
+    own_update = client.patch(
+        f"/api/products/{product.json()['id']}",
+        json={"stock": 7},
+        headers=first_headers,
+    )
+    assert own_update.status_code == 200
+    assert own_update.json()["stock"] == 7
+    store = client.patch(
+        "/api/merchant/store",
+        json={"name": "Sample", "address": "Sample", "description": "Sample"},
+        headers=first_headers,
+    )
+    assert store.status_code == 200
+    assert store.json()["address"] == "Sample"
+
+
+def test_account_password_change_and_deletion_preserve_orders(client: TestClient):
+    admin = auth(client, "admin@example.com", "admin-password")
+    buyer = auth(client, "buyer@example.com", "buyer-password")
+    assert client.request(
+        "DELETE", "/api/account", json={"password": "admin-password"}, headers=admin
+    ).status_code == 403
+    product = client.post(
+        "/api/products",
+        json={"sku": "ACCOUNT-1", "name": "Sample", "price": "10.00", "stock": 2},
+        headers=admin,
+    ).json()
+    client.post("/api/cart/items", json={"product_id": product["id"], "quantity": 1}, headers=buyer)
+    order = client.post("/api/orders", json=delivery_details(), headers=buyer).json()
+    assert client.patch(
+        "/api/account/password",
+        json={"current_password": "wrong-password", "new_password": "new-buyer-password"},
+        headers=buyer,
+    ).status_code == 400
+    assert client.patch(
+        "/api/account/password",
+        json={"current_password": "buyer-password", "new_password": "new-buyer-password"},
+        headers=buyer,
+    ).status_code == 204
+    assert client.post(
+        "/api/auth/login", json={"email": "buyer@example.com", "password": "buyer-password"}
+    ).status_code == 401
+    assert client.request(
+        "DELETE", "/api/account", json={"password": "new-buyer-password"}, headers=buyer
+    ).status_code == 204
+    assert client.get("/api/auth/me", headers=buyer).status_code == 401
+    admin_orders = client.get("/api/admin/orders", headers=admin)
+    assert admin_orders.status_code == 200
+    assert admin_orders.json()[0]["id"] == order["id"]
+    assert admin_orders.json()[0]["customer_email"].endswith("@deleted.invalid")
+
+
+def test_merchant_account_deletion_unlists_products(client: TestClient):
+    client.post(
+        "/api/auth/register",
+        json={"email": "delete-merchant@example.com", "password": "merchant-password", "role": "merchant", "store_name": "Sample"},
+    )
+    merchant = auth(client, "delete-merchant@example.com", "merchant-password", "merchant")
+    product = client.post(
+        "/api/products",
+        json={"sku": "DELETE-1", "name": "Sample", "price": "5.00", "stock": 1},
+        headers=merchant,
+    ).json()
+    assert client.request(
+        "DELETE", "/api/account", json={"password": "merchant-password"}, headers=merchant
+    ).status_code == 204
+    assert client.get(f"/api/products/{product['id']}").status_code == 404
+    admin = auth(client, "admin@example.com", "admin-password")
+    inventory = client.get("/api/admin/products", headers=admin).json()
+    assert inventory[0]["seller_id"] is None
+    assert inventory[0]["is_active"] is False
+
+
+def test_image_upload_uses_storage_and_rejects_non_owner(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    client.post(
+        "/api/auth/register",
+        json={"email": "image-merchant@example.com", "password": "merchant-password", "role": "merchant", "store_name": "Sample"},
+    )
+    owner = auth(client, "image-merchant@example.com", "merchant-password", "merchant")
+    other = auth(client, "buyer@example.com", "buyer-password")
+    product = client.post(
+        "/api/products",
+        json={"sku": "IMAGE-1", "name": "Sample", "price": "5.00", "stock": 1},
+        headers=owner,
+    ).json()
     monkeypatch.setattr(
-        "app.main.send_email_login_code",
-        lambda email, code: sent.append((email, code)),
+        "app.main.upload_public_image",
+        lambda content, content_type, prefix: f"https://storage.example/{prefix}/image.png",
     )
+    image = ("image.png", b"\x89PNG\r\n\x1a\nimage", "image/png")
+    uploaded = client.post(f"/api/products/{product['id']}/image", files={"image": image}, headers=owner)
+    assert uploaded.status_code == 200
+    assert "/products/" in uploaded.json()["image_url"]
+    assert client.post(
+        f"/api/products/{product['id']}/image", files={"image": image}, headers=other
+    ).status_code == 403
 
-    requested = client.post(
-        "/api/auth/email-code",
-        json={"email": "New.Customer@example.com"},
-    )
-    assert requested.status_code == 200
-    assert requested.json()["detail"] == "验证码已发送"
-    assert sent[0][0] == "new.customer@example.com"
-    assert len(sent[0][1]) == 6
-    assert sent[0][1].isdigit()
 
-    verified = client.post(
-        "/api/auth/email-code/verify",
-        json={"email": sent[0][0], "code": sent[0][1]},
-    )
-    assert verified.status_code == 200
-    profile = client.get(
-        "/api/auth/me",
-        headers={"Authorization": f"Bearer {verified.json()['access_token']}"},
+def test_account_avatar_upload_updates_profile(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    buyer = auth(client, "buyer@example.com", "buyer-password")
+    profile = client.patch(
+        "/api/account/profile",
+        json={"display_name": "Sample User"},
+        headers=buyer,
     )
     assert profile.status_code == 200
-    assert profile.json() == {
-        "id": profile.json()["id"],
-        "email": "new.customer@example.com",
-        "role": "customer",
-    }
-
-    reused = client.post(
-        "/api/auth/email-code/verify",
-        json={"email": sent[0][0], "code": sent[0][1]},
-    )
-    assert reused.status_code == 401
-
-
-def test_email_code_resend_cooldown_and_attempt_limit(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    sent: list[str] = []
+    assert profile.json()["display_name"] == "Sample User"
     monkeypatch.setattr(
-        "app.main.send_email_login_code",
-        lambda email, code: sent.append(code),
+        "app.main.upload_public_image",
+        lambda content, content_type, prefix: f"https://storage.example/{prefix}/avatar.png",
     )
-    email = "code-test@example.com"
-    assert client.post("/api/auth/email-code", json={"email": email}).status_code == 200
-    limited = client.post("/api/auth/email-code", json={"email": email})
-    assert limited.status_code == 429
-    assert limited.headers["retry-after"]
-
-    invalid_code = f"{(int(sent[0]) + 1) % 1_000_000:06d}"
-    for _ in range(5):
-        response = client.post(
-            "/api/auth/email-code/verify",
-            json={"email": email, "code": invalid_code},
-        )
-        assert response.status_code == 401
-
-    locked_out = client.post(
-        "/api/auth/email-code/verify",
-        json={"email": email, "code": sent[0]},
-    )
-    assert locked_out.status_code == 401
-    still_rate_limited = client.post("/api/auth/email-code", json={"email": email})
-    assert still_rate_limited.status_code == 429
-
-
-def test_email_code_can_sign_in_existing_admin(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    sent: list[str] = []
-    monkeypatch.setattr(
-        "app.main.send_email_login_code",
-        lambda email, code: sent.append(code),
-    )
-    assert client.post(
-        "/api/auth/email-code",
-        json={"email": "admin@example.com"},
-    ).status_code == 200
-    verified = client.post(
-        "/api/auth/email-code/verify",
-        json={"email": "admin@example.com", "code": sent[0]},
-    )
-    profile = client.get(
-        "/api/auth/me",
-        headers={"Authorization": f"Bearer {verified.json()['access_token']}"},
-    )
-    assert profile.json()["role"] == "admin"
-
-
-def test_email_code_returns_configuration_error_when_resend_is_unavailable(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    def missing_configuration(email: str, code: str) -> None:
-        raise RuntimeError("Email login is not configured")
-
-    monkeypatch.setattr("app.main.send_email_login_code", missing_configuration)
     response = client.post(
-        "/api/auth/email-code",
-        json={"email": "new-user@example.com"},
+        "/api/account/avatar",
+        files={"image": ("avatar.png", b"\x89PNG\r\n\x1a\nimage", "image/png")},
+        headers=buyer,
     )
-    assert response.status_code == 503
+    assert response.status_code == 200
+    assert response.json()["avatar_url"].endswith("/avatar.png")
+
+
+def test_storage_image_validation_and_upload(monkeypatch: pytest.MonkeyPatch):
+    settings = Settings(
+        supabase_url="https://project.supabase.co",
+        supabase_service_role_key="server-secret",
+        supabase_storage_bucket="shop-images",
+    )
+    monkeypatch.setattr("app.storage.get_settings", lambda: settings)
+    calls: list[tuple[str, bytes]] = []
+
+    class SuccessfulResponse:
+        def raise_for_status(self):
+            return None
+
+    def fake_put(url: str, **kwargs):
+        calls.append((url, kwargs["content"]))
+        return SuccessfulResponse()
+
+    monkeypatch.setattr("app.storage.httpx.put", fake_put)
+    with pytest.raises(ValueError):
+        upload_public_image(b"not an image", "image/png", "avatars/1")
+    with pytest.raises(ValueError):
+        upload_public_image(b"\xff\xd8\xff" + b"x" * MAX_IMAGE_SIZE, "image/jpeg", "avatars/1")
+
+    url = upload_public_image(b"\x89PNG\r\n\x1a\nimage", "image/png", "avatars/1")
+    assert url.startswith("https://project.supabase.co/storage/v1/object/public/shop-images/avatars/1/")
+    assert len(calls) == 1
+    assert calls[0][1] == b"\x89PNG\r\n\x1a\nimage"
 
 
 def test_frontend_is_served_when_a_production_build_is_present(client: TestClient):

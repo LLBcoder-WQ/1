@@ -1,11 +1,10 @@
-import hmac
 import secrets
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete, select, update
@@ -13,14 +12,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.config import get_settings
-from app.database import Base, engine, ensure_order_shipping_columns, get_db
-from app.dependencies import get_current_user, require_admin
-from app.email_auth import create_email_code, hash_email_code, send_email_login_code
+from app.database import Base, engine, ensure_account_columns, ensure_order_shipping_columns, get_db
+from app.dependencies import get_current_user, require_admin, require_shop_manager
 from app.models import (
     CartItem,
     Category,
     Coupon,
-    EmailLoginCode,
+    MerchantStore,
     Order,
     OrderItem,
     Payment,
@@ -39,22 +37,27 @@ from app.schemas import (
     CouponCreate,
     CouponRead,
     CouponUpdate,
-    EmailCodeRequest,
-    EmailCodeVerify,
+    AccountDelete,
     LoginInput,
+    PasswordChange,
+    ProfileUpdate,
     OrderRead,
     PaymentRead,
     ProductCreate,
     ProductRead,
     ProductUpdate,
     ShipmentCreate,
+    StoreRead,
+    StoreUpdate,
     TokenRead,
     UserCreate,
     UserRead,
 )
 from app.security import create_access_token, hash_password, verify_password
+from app.storage import delete_public_image, upload_public_image
 
 Base.metadata.create_all(bind=engine)
+ensure_account_columns()
 ensure_order_shipping_columns()
 app = FastAPI(title="FastAPI Shop", version="0.1.0")
 cors_origins = [
@@ -72,10 +75,8 @@ if cors_origins:
 DbSession = Annotated[Session, Depends(get_db)]
 CurrentUser = Annotated[User, Depends(get_current_user)]
 AdminUser = Annotated[User, Depends(require_admin)]
+ShopManagerUser = Annotated[User, Depends(require_shop_manager)]
 Money = Decimal("0.01")
-EMAIL_CODE_TTL_SECONDS = 10 * 60
-EMAIL_CODE_RESEND_SECONDS = 60
-EMAIL_CODE_MAX_ATTEMPTS = 5
 
 
 def money(value: Decimal) -> Decimal:
@@ -123,7 +124,13 @@ def health():
 
 @app.post("/api/auth/register", response_model=UserRead, status_code=status.HTTP_201_CREATED)
 def register(payload: UserCreate, db: DbSession):
-    user = User(email=payload.email.lower(), password_hash=hash_password(payload.password))
+    user = User(
+        email=str(payload.email).lower(),
+        password_hash=hash_password(payload.password),
+        role=payload.role,
+    )
+    if payload.role == "merchant":
+        user.store = MerchantStore(name=payload.store_name or "")
     db.add(user)
     try:
         db.commit()
@@ -136,113 +143,103 @@ def register(payload: UserCreate, db: DbSession):
 
 @app.post("/api/auth/login", response_model=TokenRead)
 def login(payload: LoginInput, db: DbSession):
-    user = db.scalar(select(User).where(User.email == payload.email.lower()))
+    user = db.scalar(select(User).where(User.email == str(payload.email).lower()))
     if user is None or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
-    return TokenRead(access_token=create_access_token(user.id, user.role))
-
-
-@app.post("/api/auth/email-code")
-def request_email_code(payload: EmailCodeRequest, db: DbSession):
-    email = str(payload.email).lower()
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    code_record = db.get(EmailLoginCode, email)
-    if code_record is not None:
-        seconds_since_last_send = (now - code_record.last_sent_at).total_seconds()
-        if seconds_since_last_send < EMAIL_CODE_RESEND_SECONDS:
-            retry_after = max(1, EMAIL_CODE_RESEND_SECONDS - int(seconds_since_last_send))
-            raise HTTPException(
-                status_code=429,
-                detail=f"请稍后再试，{retry_after} 秒后可重新发送",
-                headers={"Retry-After": str(retry_after)},
-            )
-
-    code = create_email_code()
-    if code_record is None:
-        code_record = EmailLoginCode(email=email)
-        db.add(code_record)
-    code_record.code_hash = hash_email_code(email, code)
-    code_record.expires_at = now + timedelta(seconds=EMAIL_CODE_TTL_SECONDS)
-    code_record.last_sent_at = now
-    code_record.attempts = 0
-    db.commit()
-
-    try:
-        send_email_login_code(email, code)
-    except RuntimeError as error:
-        if str(error) == "Email login is not configured":
-            raise HTTPException(
-                status_code=503,
-                detail="邮箱登录尚未配置，请联系店铺管理员",
-            ) from None
-        raise HTTPException(
-            status_code=502,
-            detail="验证码邮件发送失败，请稍后重试",
-        ) from None
-
-    return {"detail": "验证码已发送"}
-
-
-@app.post("/api/auth/email-code/verify", response_model=TokenRead)
-def verify_email_code(payload: EmailCodeVerify, db: DbSession):
-    email = str(payload.email).lower()
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    code_record = db.get(EmailLoginCode, email)
-    unauthorized = HTTPException(status_code=401, detail="验证码无效或已过期")
-    if code_record is None or code_record.expires_at <= now:
-        raise unauthorized
-    if code_record.attempts >= EMAIL_CODE_MAX_ATTEMPTS:
-        raise unauthorized
-    if not hmac.compare_digest(code_record.code_hash, hash_email_code(email, payload.code)):
-        db.execute(
-            update(EmailLoginCode)
-            .where(
-                EmailLoginCode.email == email,
-                EmailLoginCode.expires_at > now,
-                EmailLoginCode.attempts < EMAIL_CODE_MAX_ATTEMPTS,
-            )
-            .values(attempts=EmailLoginCode.attempts + 1)
-        )
-        db.commit()
-        raise unauthorized
-
-    claimed_email = db.execute(
-        delete(EmailLoginCode)
-        .where(
-            EmailLoginCode.email == email,
-            EmailLoginCode.code_hash == code_record.code_hash,
-            EmailLoginCode.expires_at > now,
-            EmailLoginCode.attempts < EMAIL_CODE_MAX_ATTEMPTS,
-        )
-        .returning(EmailLoginCode.email)
-    ).scalar_one_or_none()
-    if claimed_email is None:
-        db.rollback()
-        raise unauthorized
-
-    user = db.scalar(select(User).where(User.email == email))
-    if user is None:
-        user = User(
-            email=email,
-            password_hash=hash_password(secrets.token_urlsafe(32)),
-            role="customer",
-        )
-        db.add(user)
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        user = db.scalar(select(User).where(User.email == email))
-        if user is None:
-            raise HTTPException(status_code=409, detail="登录失败，请重新获取验证码") from None
-    if user is None:
-        raise HTTPException(status_code=401, detail="验证码无效或已过期")
+    if user.role != "admin" and user.role != payload.role:
+        raise HTTPException(status_code=403, detail="登录入口与账号身份不匹配")
     return TokenRead(access_token=create_access_token(user.id, user.role))
 
 
 @app.get("/api/auth/me", response_model=UserRead)
 def me(user: CurrentUser):
     return user
+
+
+@app.patch("/api/account/profile", response_model=UserRead)
+def update_account_profile(payload: ProfileUpdate, db: DbSession, user: CurrentUser):
+    if "display_name" in payload.model_fields_set:
+        user.display_name = payload.display_name
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@app.post("/api/account/avatar", response_model=UserRead)
+def upload_account_avatar(
+    db: DbSession,
+    user: CurrentUser,
+    image: UploadFile = File(...),
+):
+    content = image.file.read(5 * 1024 * 1024 + 1)
+    try:
+        user.avatar_url = upload_public_image(content, image.content_type or "", f"avatars/{user.id}")
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    except RuntimeError:
+        raise HTTPException(status_code=503, detail="头像存储服务未配置或暂时不可用") from None
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@app.patch("/api/account/password", status_code=204)
+def change_account_password(payload: PasswordChange, db: DbSession, user: CurrentUser):
+    if not verify_password(payload.current_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="当前密码不正确")
+    user.password_hash = hash_password(payload.new_password)
+    db.commit()
+
+
+@app.delete("/api/account", status_code=204)
+def delete_account(payload: AccountDelete, db: DbSession, user: CurrentUser):
+    if user.role == "admin":
+        raise HTTPException(status_code=403, detail="管理员账户不能通过此入口注销")
+    if not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=400, detail="密码不正确")
+    if user.avatar_url:
+        try:
+            delete_public_image(user.avatar_url)
+        except (RuntimeError, ValueError):
+            raise HTTPException(status_code=502, detail="头像删除失败，请稍后重试") from None
+
+    db.execute(delete(CartItem).where(CartItem.user_id == user.id))
+    db.execute(
+        update(Product)
+        .where(Product.seller_id == user.id)
+        .values(seller_id=None, is_active=False)
+    )
+    if user.store is not None:
+        user.store.name = "已注销店铺"
+        user.store.address = ""
+        user.store.description = ""
+    user.email = f"deleted-{user.id}-{secrets.token_hex(4)}@deleted.invalid"
+    user.password_hash = hash_password(secrets.token_urlsafe(32))
+    user.role = "deleted"
+    user.display_name = None
+    user.avatar_url = None
+    db.commit()
+
+
+@app.get("/api/merchant/store", response_model=StoreRead)
+def get_merchant_store(user: ShopManagerUser):
+    if user.store is None:
+        raise HTTPException(status_code=404, detail="Store profile not found")
+    return user.store
+
+
+@app.patch("/api/merchant/store", response_model=StoreRead)
+def update_merchant_store(payload: StoreUpdate, db: DbSession, user: ShopManagerUser):
+    if user.role == "admin":
+        raise HTTPException(status_code=403, detail="管理员账号不能编辑商家店铺资料")
+    if user.store is None:
+        raise HTTPException(status_code=404, detail="Store profile not found")
+    user.store.name = payload.name
+    user.store.address = payload.address
+    user.store.description = payload.description
+    db.commit()
+    db.refresh(user.store)
+    return user.store
 
 
 @app.get("/api/categories", response_model=list[CategoryRead])
@@ -271,7 +268,11 @@ def list_products(
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
 ):
-    query = select(Product).where(Product.is_active.is_(True))
+    query = (
+        select(Product)
+        .options(selectinload(Product.seller).selectinload(User.store))
+        .where(Product.is_active.is_(True))
+    )
     if category_id is not None:
         query = query.where(Product.category_id == category_id)
     if search:
@@ -281,7 +282,11 @@ def list_products(
 
 @app.get("/api/products/{product_id}", response_model=ProductRead)
 def get_product(product_id: int, db: DbSession):
-    product = db.scalar(select(Product).where(Product.id == product_id, Product.is_active.is_(True)))
+    product = db.scalar(
+        select(Product)
+        .options(selectinload(Product.seller).selectinload(User.store))
+        .where(Product.id == product_id, Product.is_active.is_(True))
+    )
     if product is None:
         raise HTTPException(status_code=404, detail="Product not found")
     return product
@@ -289,14 +294,31 @@ def get_product(product_id: int, db: DbSession):
 
 @app.get("/api/admin/products", response_model=list[ProductRead])
 def list_admin_products(db: DbSession, _: AdminUser):
-    return list(db.scalars(select(Product).order_by(Product.id.desc())))
+    return list(
+        db.scalars(
+            select(Product)
+            .options(selectinload(Product.seller).selectinload(User.store))
+            .order_by(Product.id.desc())
+        )
+    )
+
+
+@app.get("/api/merchant/products", response_model=list[ProductRead])
+def list_merchant_products(db: DbSession, user: ShopManagerUser):
+    query = select(Product).options(selectinload(Product.seller).selectinload(User.store))
+    if user.role != "admin":
+        query = query.where(Product.seller_id == user.id)
+    return list(db.scalars(query.order_by(Product.id.desc())))
 
 
 @app.post("/api/products", response_model=ProductRead, status_code=201)
-def create_product(payload: ProductCreate, db: DbSession, _: AdminUser):
+def create_product(payload: ProductCreate, db: DbSession, user: ShopManagerUser):
     if payload.category_id is not None and db.get(Category, payload.category_id) is None:
         raise HTTPException(status_code=404, detail="Category not found")
-    product = Product(**payload.model_dump())
+    product = Product(
+        **payload.model_dump(),
+        seller_id=user.id if user.role == "merchant" else None,
+    )
     db.add(product)
     try:
         db.commit()
@@ -308,9 +330,11 @@ def create_product(payload: ProductCreate, db: DbSession, _: AdminUser):
 
 
 @app.patch("/api/products/{product_id}", response_model=ProductRead)
-def update_product(product_id: int, payload: ProductUpdate, db: DbSession, _: AdminUser):
+def update_product(product_id: int, payload: ProductUpdate, db: DbSession, user: ShopManagerUser):
     product = db.get(Product, product_id)
     if product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    if user.role != "admin" and product.seller_id != user.id:
         raise HTTPException(status_code=404, detail="Product not found")
     changes = payload.model_dump(exclude_unset=True)
     if "category_id" in changes and changes["category_id"] is not None:
@@ -323,6 +347,32 @@ def update_product(product_id: int, payload: ProductUpdate, db: DbSession, _: Ad
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=409, detail="SKU already exists") from None
+    db.refresh(product)
+    return product
+
+
+@app.post("/api/products/{product_id}/image", response_model=ProductRead)
+def upload_product_image(
+    product_id: int,
+    db: DbSession,
+    user: ShopManagerUser,
+    image: UploadFile = File(...),
+):
+    product = db.get(Product, product_id)
+    if product is None or (user.role != "admin" and product.seller_id != user.id):
+        raise HTTPException(status_code=404, detail="Product not found")
+    content = image.file.read(5 * 1024 * 1024 + 1)
+    try:
+        product.image_url = upload_public_image(
+            content,
+            image.content_type or "",
+            f"products/{product.seller_id or user.id}",
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    except RuntimeError:
+        raise HTTPException(status_code=503, detail="商品图片存储未配置或暂时不可用") from None
+    db.commit()
     db.refresh(product)
     return product
 

@@ -9,6 +9,16 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, mo
 class UserCreate(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
+    role: Literal["customer", "merchant"] = "customer"
+    store_name: str | None = Field(default=None, min_length=1, max_length=120)
+
+    @model_validator(mode="after")
+    def require_merchant_store_name(self):
+        if self.store_name is not None:
+            self.store_name = self.store_name.strip()
+        if self.role == "merchant" and not self.store_name:
+            raise ValueError("store_name is required for merchant accounts")
+        return self
 
 
 class UserRead(BaseModel):
@@ -17,20 +27,14 @@ class UserRead(BaseModel):
     id: int
     email: EmailStr
     role: str
+    display_name: str | None
+    avatar_url: str | None
 
 
 class LoginInput(BaseModel):
     email: EmailStr
     password: str
-
-
-class EmailCodeRequest(BaseModel):
-    email: EmailStr
-
-
-class EmailCodeVerify(BaseModel):
-    email: EmailStr
-    code: str = Field(pattern=r"^[0-9]{6}$")
+    role: Literal["customer", "merchant"] = "customer"
 
 
 class TokenRead(BaseModel):
@@ -73,11 +77,12 @@ class ProductUpdate(BaseModel):
     stock: int | None = Field(default=None, ge=0)
     category_id: int | None = None
     is_active: bool | None = None
+    image_url: str | None = Field(default=None, max_length=1000)
 
     @model_validator(mode="after")
     def reject_null_non_nullable_fields(self):
         for field_name, value in self.model_dump(exclude_unset=True).items():
-            if value is None and field_name != "category_id":
+            if value is None and field_name not in {"category_id", "image_url"}:
                 raise ValueError(f"{field_name} cannot be null")
         return self
 
@@ -93,6 +98,55 @@ class ProductRead(BaseModel):
     stock: int
     is_active: bool
     category_id: int | None
+    image_url: str | None
+    seller_id: int | None
+    store_name: str | None
+    store_address: str | None
+
+
+class ProfileUpdate(BaseModel):
+    display_name: str | None = Field(default=None, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_profile(self):
+        if not self.model_fields_set:
+            raise ValueError("provide a profile field to update")
+        if self.display_name is not None:
+            self.display_name = self.display_name.strip() or None
+        return self
+
+
+class PasswordChange(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+class AccountDelete(BaseModel):
+    password: str = Field(min_length=1, max_length=128)
+
+
+class StoreUpdate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    address: str = Field(default="", max_length=300)
+    description: str = Field(default="", max_length=1000)
+
+    @model_validator(mode="after")
+    def normalize_store_fields(self):
+        self.name = self.name.strip()
+        self.address = self.address.strip()
+        self.description = self.description.strip()
+        if not self.name:
+            raise ValueError("store name cannot be blank")
+        return self
+
+
+class StoreRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    address: str
+    description: str
 
 
 class CartItemInput(BaseModel):
@@ -234,7 +288,7 @@ class OrderRead(BaseModel):
 
 
 class AdminOrderRead(OrderRead):
-    customer_email: EmailStr
+    customer_email: str
 
 
 class PaymentRead(BaseModel):
