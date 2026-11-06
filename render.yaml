@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: shiji-shop-api
+    runtime: python
+    plan: free
+    buildCommand: pip install .
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: SHOP_ENVIRONMENT
+        value: production
+      - key: SHOP_SECRET_KEY
+        generateValue: true
+      - key: SHOP_DATABASE_URL
+        sync: false
+      - key: SHOP_CORS_ORIGINS
+        sync: false
