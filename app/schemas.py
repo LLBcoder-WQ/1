@@ -104,6 +104,33 @@ class ProductRead(BaseModel):
     store_address: str | None
 
 
+class ProductReviewCreate(BaseModel):
+    rating: int = Field(ge=1, le=5)
+    content: str = Field(min_length=1, max_length=1000)
+
+    @field_validator("content")
+    @classmethod
+    def normalize_content(cls, value: str) -> str:
+        content = value.strip()
+        if not content:
+            raise ValueError("review content cannot be blank")
+        return content
+
+
+class ProductReviewRead(BaseModel):
+    id: int
+    product_id: int
+    rating: int
+    content: str
+    author_name: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class FavoriteStatus(BaseModel):
+    is_favorited: bool
+
+
 class ProfileUpdate(BaseModel):
     display_name: str | None = Field(default=None, max_length=100)
 

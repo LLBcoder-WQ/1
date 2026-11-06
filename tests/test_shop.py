@@ -544,6 +544,73 @@ def test_account_avatar_upload_updates_profile(client: TestClient, monkeypatch: 
     assert response.json()["avatar_url"].endswith("/avatar.png")
 
 
+def test_product_reviews_are_public_and_upsert_per_customer(client: TestClient):
+    admin = auth(client, "admin@example.com", "admin-password")
+    buyer = auth(client, "buyer@example.com", "buyer-password")
+    product = client.post(
+        "/api/products",
+        json={"sku": "REVIEW-1", "name": "Review item", "price": "8.00", "stock": 2},
+        headers=admin,
+    ).json()
+    product_id = product["id"]
+
+    assert client.get(f"/api/products/{product_id}/reviews").json() == []
+    assert client.post(
+        f"/api/products/{product_id}/reviews",
+        json={"rating": 6, "content": "Invalid rating"},
+        headers=buyer,
+    ).status_code == 422
+    first = client.post(
+        f"/api/products/{product_id}/reviews",
+        json={"rating": 4, "content": "  Nice quality  "},
+        headers=buyer,
+    )
+    assert first.status_code == 200
+    assert first.json()["content"] == "Nice quality"
+    updated = client.post(
+        f"/api/products/{product_id}/reviews",
+        json={"rating": 5, "content": "Even better than expected"},
+        headers=buyer,
+    )
+    assert updated.status_code == 200
+    reviews = client.get(f"/api/products/{product_id}/reviews")
+    assert reviews.status_code == 200
+    assert len(reviews.json()) == 1
+    assert reviews.json()[0]["rating"] == 5
+    assert reviews.json()[0]["author_name"] == "用户2"
+    assert client.post(
+        f"/api/products/{product_id}/reviews",
+        json={"rating": 3, "content": "Guest review"},
+    ).status_code == 401
+
+
+def test_product_favorites_are_private_and_idempotent(client: TestClient):
+    admin = auth(client, "admin@example.com", "admin-password")
+    buyer = auth(client, "buyer@example.com", "buyer-password")
+    product = client.post(
+        "/api/products",
+        json={"sku": "FAVORITE-1", "name": "Favorite item", "price": "9.00", "stock": 1},
+        headers=admin,
+    ).json()
+    product_id = product["id"]
+
+    assert client.put(f"/api/products/{product_id}/favorite").status_code == 401
+    assert client.get("/api/favorites", headers=buyer).json() == []
+    assert client.put(
+        f"/api/products/{product_id}/favorite", headers=buyer
+    ).json() == {"is_favorited": True}
+    assert client.put(
+        f"/api/products/{product_id}/favorite", headers=buyer
+    ).json() == {"is_favorited": True}
+    saved = client.get("/api/favorites", headers=buyer)
+    assert [item["id"] for item in saved.json()] == [product_id]
+    assert client.request("DELETE", "/api/account", json={"password": "buyer-password"}, headers=buyer).status_code == 204
+    assert client.get("/api/favorites", headers=admin).json() == []
+    assert client.delete(
+        f"/api/products/{product_id}/favorite", headers=admin
+    ).json() == {"is_favorited": False}
+
+
 def test_storage_image_validation_and_upload(monkeypatch: pytest.MonkeyPatch):
     settings = Settings(
         supabase_url="https://project.supabase.co",

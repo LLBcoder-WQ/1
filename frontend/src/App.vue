@@ -10,12 +10,14 @@ import {
   type MerchantStore,
   type Order,
   type Product,
+  type ProductReview,
   type User,
 } from './api'
 
-type View = 'shop' | 'orders' | 'admin'
+type View = 'shop' | 'favorites' | 'orders' | 'admin'
 type AccountRole = 'customer' | 'merchant'
 const products = ref<Product[]>([])
+const favoriteProducts = ref<Product[]>([])
 const inventoryProducts = ref<Product[]>([])
 const categories = ref<Category[]>([])
 const cart = ref<Cart>({ items: [], subtotal: '0.00' })
@@ -28,6 +30,12 @@ const user = ref<User | null>(null)
 const merchantStore = ref<MerchantStore | null>(null)
 const token = ref(localStorage.getItem('shop-token') ?? '')
 const currentView = ref<View>('shop')
+const selectedProduct = ref<Product | null>(null)
+const productReviews = ref<ProductReview[]>([])
+const reviewsLoading = ref(false)
+const reviewSubmitting = ref(false)
+const reviewDraft = ref({ rating: 5, content: '' })
+const favoriteLoading = ref(false)
 const activeCategory = ref<number | null>(null)
 const search = ref('')
 const loading = ref(false)
@@ -74,6 +82,18 @@ const couponForm = ref({
 })
 
 const cartCount = computed(() => cart.value.items.reduce((sum, item) => sum + item.quantity, 0))
+const favoriteProductIds = computed(() => new Set(favoriteProducts.value.map((product) => product.id)))
+const averageRating = computed(() => {
+  if (!productReviews.value.length) return '暂无评分'
+  const average =
+    productReviews.value.reduce((sum, review) => sum + review.rating, 0) / productReviews.value.length
+  return average.toFixed(1)
+})
+const averageRatingStars = computed(() => {
+  if (!productReviews.value.length) return '☆☆☆☆☆'
+  const roundedRating = Math.round(Number(averageRating.value))
+  return '★'.repeat(roundedRating) + '☆'.repeat(5 - roundedRating)
+})
 const filteredProducts = computed(() => {
   const term = search.value.trim().toLocaleLowerCase()
   return products.value.filter((product) => {
@@ -156,6 +176,91 @@ async function loadCart() {
 
 async function loadOrders() {
   orders.value = await api<Order[]>('/orders', { token: token.value })
+}
+
+async function loadFavorites() {
+  if (!token.value) {
+    favoriteProducts.value = []
+    return
+  }
+  favoriteProducts.value = await api<Product[]>('/favorites', { token: token.value })
+}
+
+async function loadProductReviews(productId: number) {
+  reviewsLoading.value = true
+  try {
+    const reviews = await api<ProductReview[]>(`/products/${productId}/reviews`)
+    if (selectedProduct.value?.id === productId) productReviews.value = reviews
+  } catch (reason) {
+    if (selectedProduct.value?.id === productId) {
+      showError(reason instanceof Error ? reason.message : '评论加载失败')
+    }
+  } finally {
+    if (selectedProduct.value?.id === productId) reviewsLoading.value = false
+  }
+}
+
+async function openProductDetails(product: Product) {
+  selectedProduct.value = product
+  reviewDraft.value = { rating: 5, content: '' }
+  productReviews.value = []
+  void loadProductReviews(product.id)
+  try {
+    selectedProduct.value = await api<Product>(`/products/${product.id}`)
+  } catch (reason) {
+    showError(reason instanceof Error ? reason.message : '商品详情加载失败')
+    selectedProduct.value = null
+  }
+}
+
+function closeProductDetails() {
+  selectedProduct.value = null
+  productReviews.value = []
+}
+
+async function toggleFavorite(product: Product) {
+  if (!user.value) {
+    openAuth()
+    return
+  }
+  if (favoriteLoading.value) return
+  favoriteLoading.value = true
+  try {
+    const isFavorited = favoriteProductIds.value.has(product.id)
+    await api<{ is_favorited: boolean }>(`/products/${product.id}/favorite`, {
+      method: isFavorited ? 'DELETE' : 'PUT',
+      token: token.value,
+    })
+    await loadFavorites()
+    notify(isFavorited ? '已从收藏中移除' : '已收藏这件好物')
+  } catch (reason) {
+    showError(reason instanceof Error ? reason.message : '收藏操作失败')
+  } finally {
+    favoriteLoading.value = false
+  }
+}
+
+async function submitProductReview() {
+  if (!user.value) {
+    openAuth()
+    return
+  }
+  if (!selectedProduct.value || !reviewDraft.value.content.trim()) return
+  reviewSubmitting.value = true
+  try {
+    await api<ProductReview>(`/products/${selectedProduct.value.id}/reviews`, {
+      method: 'POST',
+      token: token.value,
+      body: { rating: reviewDraft.value.rating, content: reviewDraft.value.content.trim() },
+    })
+    reviewDraft.value.content = ''
+    await loadProductReviews(selectedProduct.value.id)
+    notify('评论已发布')
+  } catch (reason) {
+    showError(reason instanceof Error ? reason.message : '评论发布失败')
+  } finally {
+    reviewSubmitting.value = false
+  }
 }
 
 async function loadCoupons() {
@@ -261,7 +366,7 @@ async function submitAuth() {
     user.value = await api<User>('/auth/me', { token: token.value })
     authOpen.value = false
     authForm.value.password = ''
-    await loadCart()
+    await Promise.all([loadCart(), loadFavorites()])
     if (canManageShop.value) await Promise.all([loadInventory(), loadMerchantStore()])
     if (isAdmin.value) await Promise.all([loadCoupons(), loadAdminOrders()])
     notify(`欢迎回来，${user.value.email}`)
@@ -276,7 +381,7 @@ async function restoreSession() {
   if (!token.value) return
   try {
     user.value = await api<User>('/auth/me', { token: token.value })
-    await loadCart()
+    await Promise.all([loadCart(), loadFavorites()])
     if (canManageShop.value) await Promise.all([loadInventory(), loadMerchantStore()])
     if (isAdmin.value) await Promise.all([loadCoupons(), loadAdminOrders()])
   } catch (reason) {
@@ -294,6 +399,7 @@ function signOut() {
   token.value = ''
   user.value = null
   cart.value = { items: [], subtotal: '0.00' }
+  favoriteProducts.value = []
   orders.value = []
   merchantStore.value = null
   coupons.value = []
@@ -605,6 +711,18 @@ async function toggleProduct(product: Product) {
 
 async function changeView(view: View) {
   currentView.value = view
+  if (view === 'favorites' && !user.value) {
+    currentView.value = 'shop'
+    openAuth()
+    return
+  }
+  if (view === 'favorites' && user.value) {
+    try {
+      await loadFavorites()
+    } catch (reason) {
+      showError(reason instanceof Error ? reason.message : '收藏列表加载失败')
+    }
+  }
   if (view === 'orders' && user.value) {
     try {
       await loadOrders()
@@ -653,6 +771,9 @@ onMounted(async () => {
       </a>
       <nav class="main-nav" aria-label="主导航">
         <button :class="{ selected: currentView === 'shop' }" @click="changeView('shop')">逛逛</button>
+        <button v-if="user" :class="{ selected: currentView === 'favorites' }" @click="changeView('favorites')">
+          我的收藏
+        </button>
         <button v-if="user" :class="{ selected: currentView === 'orders' }" @click="changeView('orders')">
           我的订单
         </button>
@@ -736,7 +857,12 @@ onMounted(async () => {
 
           <div v-if="loading" class="empty-state"><span class="loading-mark"></span><p>正在为你准备好物…</p></div>
           <div v-else-if="filteredProducts.length" class="product-grid">
-            <article v-for="(product, index) in filteredProducts" :key="product.id" class="product-card">
+            <article
+              v-for="(product, index) in filteredProducts"
+              :key="product.id"
+              class="product-card"
+              @click="openProductDetails(product)"
+            >
               <div class="product-visual" :class="productTone(index)">
                 <span class="product-category">{{ categoryNameOf(product.category_id) }}</span>
                 <img v-if="product.image_url" class="product-image" :src="product.image_url" :alt="product.name" />
@@ -748,16 +874,23 @@ onMounted(async () => {
                 <span class="product-number">NO. {{ (index + 1).toString().padStart(2, '0') }}</span>
                 <span v-if="product.stock <= 3" class="stock-badge">{{ product.stock ? '少量现货' : '暂时售罄' }}</span>
                 <button
+                  v-if="user"
+                  class="favorite-toggle"
+                  :class="{ favorited: favoriteProductIds.has(product.id) }"
+                  :aria-label="favoriteProductIds.has(product.id) ? '取消收藏' : '收藏商品'"
+                  @click.stop="toggleFavorite(product)"
+                >{{ favoriteProductIds.has(product.id) ? '♥' : '♡' }}</button>
+                <button
                   class="quick-add"
                   :disabled="product.stock <= 0"
                   :aria-label="`将${product.name}加入购物袋`"
-                  @click="addToCart(product)"
+                  @click.stop="addToCart(product)"
                 >
                   <span>+</span>
                 </button>
               </div>
               <div class="product-info">
-                <div><h3>{{ product.name }}</h3><span class="product-sku">NO. {{ product.sku }}</span></div>
+                <div><button class="product-title" @click.stop="openProductDetails(product)">{{ product.name }}</button><span class="product-sku">NO. {{ product.sku }}</span></div>
                 <span class="product-price">{{ money(product.price) }}</span>
                 <p>{{ product.description || '为日常而选，简约而不简单。' }}</p>
                 <small v-if="product.store_name" class="product-store">{{ product.store_name }}<template v-if="product.store_address"> · {{ product.store_address }}</template></small>
@@ -778,6 +911,25 @@ onMounted(async () => {
           <div><p>喜欢的东西，不需要很多。</p><span>THE LITTLE THINGS MAKE A LIFE.</span></div>
           <span class="editor-aside">拾集 · 好好生活研究所</span>
         </section>
+      </section>
+
+      <section v-if="currentView === 'favorites'" class="page-section favorites-page">
+        <div class="page-kicker">YOUR ACCOUNT &nbsp; / &nbsp; 02</div>
+        <div class="page-title-row"><div><div class="eyebrow"><span class="eyebrow-line"></span> SAVED FINDS</div><h1>我的收藏<span class="title-period">.</span></h1></div><p>喜欢的好物，先替你收好。</p></div>
+        <div v-if="!favoriteProducts.length" class="empty-state order-empty">
+          <span class="empty-flower">♡</span><h3>收藏夹还是空的</h3><p>打开商品详情，点击收藏就能在这里找到它。</p>
+          <button class="button button-dark" @click="changeView('shop')">去逛逛 <span>↗</span></button>
+        </div>
+        <div v-else class="favorite-list">
+          <article v-for="product in favoriteProducts" :key="product.id" class="favorite-card">
+            <button class="favorite-card-main" @click="openProductDetails(product)">
+              <img v-if="product.image_url" :src="product.image_url" :alt="product.name" />
+              <span v-else class="favorite-card-placeholder">拾</span>
+              <span class="favorite-card-info"><b>{{ product.name }}</b><small>{{ product.description || '为日常而选，简约而不简单。' }}</small><strong>{{ money(product.price) }}</strong></span>
+            </button>
+            <button class="favorite-remove" :aria-label="`取消收藏${product.name}`" @click="toggleFavorite(product)">移出收藏</button>
+          </article>
+        </div>
       </section>
 
       <section v-if="currentView === 'orders'" class="page-section">
@@ -913,6 +1065,65 @@ onMounted(async () => {
       <p>把日子，过成喜欢的样子。</p>
       <span>© SHIJI STUDIO · 2026</span>
     </footer>
+
+    <Transition name="fade">
+      <div v-if="selectedProduct" class="overlay product-detail-overlay" @click.self="closeProductDetails">
+        <section class="product-detail-panel" role="dialog" aria-modal="true" aria-label="商品详情">
+          <header class="detail-header">
+            <span class="eyebrow"><span class="eyebrow-line"></span> PRODUCT DETAILS</span>
+            <button class="close-button" aria-label="关闭商品详情" @click="closeProductDetails">×</button>
+          </header>
+          <div class="detail-scroll">
+            <div class="product-detail-layout">
+              <div class="detail-image">
+                <img v-if="selectedProduct.image_url" :src="selectedProduct.image_url" :alt="selectedProduct.name" />
+                <div v-else class="detail-image-placeholder"><span>拾</span></div>
+              </div>
+              <div class="detail-summary">
+                <span class="detail-category">{{ categoryNameOf(selectedProduct.category_id) }} · NO. {{ selectedProduct.sku }}</span>
+                <h1>{{ selectedProduct.name }}</h1>
+                <p class="detail-price">{{ money(selectedProduct.price) }}</p>
+                <div class="detail-rating"><span>{{ averageRatingStars }}</span>{{ averageRating }} · {{ productReviews.length }} 条评价</div>
+                <p class="detail-description">{{ selectedProduct.description || '为日常而选，简约而不简单。' }}</p>
+                <div v-if="selectedProduct.store_name" class="detail-store">
+                  <b>{{ selectedProduct.store_name }}</b>
+                  <span v-if="selectedProduct.store_address">{{ selectedProduct.store_address }}</span>
+                </div>
+                <p class="detail-stock">{{ selectedProduct.stock > 0 ? `库存 ${selectedProduct.stock} 件` : '暂时售罄' }}</p>
+                <div class="detail-actions">
+                  <button class="button button-dark" :disabled="selectedProduct.stock < 1" @click="addToCart(selectedProduct)">加入购物袋 <span>↗</span></button>
+                  <button class="button button-outline" @click="toggleFavorite(selectedProduct)">{{ favoriteProductIds.has(selectedProduct.id) ? '♥ 已收藏' : '♡ 收藏商品' }}</button>
+                </div>
+              </div>
+            </div>
+            <section class="review-section">
+              <div class="review-heading"><div><span class="eyebrow">CUSTOMER NOTES</span><h2>评论与评价</h2></div><span>{{ productReviews.length }} 条评论</span></div>
+              <form class="review-form" @submit.prevent="submitProductReview">
+                <label>你的评分</label>
+                <div class="rating-picker" role="radiogroup" aria-label="选择评分">
+                  <button v-for="rating in 5" :key="rating" type="button" :class="{ active: rating <= reviewDraft.rating }" :aria-label="`${rating} 星`" @click="reviewDraft.rating = rating">★</button>
+                  <span>{{ reviewDraft.rating }} / 5</span>
+                </div>
+                <p class="review-guidance">每个账号对同一商品只保留一条评价，重复发布会更新原评价。</p>
+                <label class="review-content-label">写下你的使用感受
+                  <textarea v-model="reviewDraft.content" required maxlength="1000" rows="3" placeholder="分享真实体验，帮助其他人挑选…" />
+                </label>
+                <button class="button button-dark" type="submit" :disabled="reviewSubmitting || !reviewDraft.content.trim()">{{ reviewSubmitting ? '正在发布…' : '发布评论' }}</button>
+              </form>
+              <div v-if="reviewsLoading" class="review-empty">正在加载评论…</div>
+              <div v-else-if="!productReviews.length" class="review-empty">还没有评论，来留下第一条评价吧。</div>
+              <div v-else class="review-list">
+                <article v-for="review in productReviews" :key="review.id" class="review-card">
+                  <div class="review-author"><b>{{ review.author_name }}</b><span>{{ '★'.repeat(review.rating) }}{{ '☆'.repeat(5 - review.rating) }}</span></div>
+                  <p>{{ review.content }}</p>
+                  <time :datetime="review.created_at">{{ new Date(review.updated_at).toLocaleString('zh-CN') }}</time>
+                </article>
+              </div>
+            </section>
+          </div>
+        </section>
+      </div>
+    </Transition>
 
     <Transition name="fade">
       <div v-if="cartOpen" class="overlay" @click.self="cartOpen = false">

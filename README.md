@@ -1,6 +1,6 @@
 # 拾集商城
 
-这是一个用于学习的电商项目，包含 Vue 前端和 FastAPI 后端，提供顾客与商家账号、头像和商品图片上传、店铺资料、商品与库存管理、购物车、订单、优惠码和演示支付等功能。
+这是一个用于学习的电商项目，包含 Vue 前端和 FastAPI 后端，提供顾客与商家账号、头像和商品图片上传、店铺资料、商品详情、评论与收藏、商品与库存管理、购物车、订单、优惠码和演示支付等功能。
 
 ## 本地运行
 
@@ -24,6 +24,8 @@ uvicorn app.main:app --reload
 
 头像和商品图片使用 Supabase Storage 保存。上传支持 JPG、PNG 和 WebP，单张最大 5 MB。
 
+商品卡片可以打开详情，查看店铺、库存和用户评价；登录后可以收藏商品、发布评分与评论。每个账号对同一商品保留一条可更新的评价，评论对访客可见；收藏仅账号本人可查看。注销账号后，收藏会清除，历史评论会匿名保留。
+
 ## 主要接口
 
 - `POST /api/auth/register`、`POST /api/auth/login`：注册和邮箱密码登录
@@ -35,6 +37,8 @@ uvicorn app.main:app --reload
 - `POST /api/products/{id}/image`：上传商品图片
 - `GET /api/categories`、`POST /api/categories`：查询和创建商品分类（创建需要管理员权限）
 - `GET /api/products`、`GET /api/products/{id}`：查询商品
+- `GET /api/products/{id}/reviews`、`POST /api/products/{id}/reviews`：查看和发布/更新商品评价
+- `GET /api/favorites`、`PUT/DELETE /api/products/{id}/favorite`：查看和管理当前账号的收藏
 - `POST /api/products`、`PATCH /api/products/{id}`：商家管理自己的商品，管理员可管理全部商品
 - `GET /api/merchant/products`：商家查询自己的商品，管理员查询全部商品
 - `GET /api/admin/products`：查询全部库存商品（需要管理员权限）

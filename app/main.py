@@ -23,6 +23,8 @@ from app.models import (
     OrderItem,
     Payment,
     Product,
+    ProductFavorite,
+    ProductReview,
     User,
 )
 from app.payments import PaymentGateway, get_payment_gateway
@@ -38,6 +40,7 @@ from app.schemas import (
     CouponRead,
     CouponUpdate,
     AccountDelete,
+    FavoriteStatus,
     LoginInput,
     PasswordChange,
     ProfileUpdate,
@@ -45,6 +48,8 @@ from app.schemas import (
     PaymentRead,
     ProductCreate,
     ProductRead,
+    ProductReviewCreate,
+    ProductReviewRead,
     ProductUpdate,
     ShipmentCreate,
     StoreRead,
@@ -204,6 +209,7 @@ def delete_account(payload: AccountDelete, db: DbSession, user: CurrentUser):
             raise HTTPException(status_code=502, detail="头像删除失败，请稍后重试") from None
 
     db.execute(delete(CartItem).where(CartItem.user_id == user.id))
+    db.execute(delete(ProductFavorite).where(ProductFavorite.user_id == user.id))
     db.execute(
         update(Product)
         .where(Product.seller_id == user.id)
@@ -290,6 +296,125 @@ def get_product(product_id: int, db: DbSession):
     if product is None:
         raise HTTPException(status_code=404, detail="Product not found")
     return product
+
+
+@app.get("/api/products/{product_id}/reviews", response_model=list[ProductReviewRead])
+def list_product_reviews(product_id: int, db: DbSession):
+    product = db.scalar(select(Product.id).where(Product.id == product_id, Product.is_active.is_(True)))
+    if product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    reviews = db.scalars(
+        select(ProductReview)
+        .options(selectinload(ProductReview.user))
+        .where(ProductReview.product_id == product_id)
+        .order_by(ProductReview.created_at.desc(), ProductReview.id.desc())
+    )
+    return [
+        ProductReviewRead(
+            id=review.id,
+            product_id=review.product_id,
+            rating=review.rating,
+            content=review.content,
+            author_name=(
+                "已注销用户"
+                if review.user.role == "deleted"
+                else review.user.display_name or f"用户{review.user.id}"
+            ),
+            created_at=review.created_at,
+            updated_at=review.updated_at,
+        )
+        for review in reviews
+    ]
+
+
+@app.post("/api/products/{product_id}/reviews", response_model=ProductReviewRead)
+def create_or_update_product_review(
+    product_id: int,
+    payload: ProductReviewCreate,
+    db: DbSession,
+    user: CurrentUser,
+):
+    product = db.scalar(select(Product.id).where(Product.id == product_id, Product.is_active.is_(True)))
+    if product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    review = db.scalar(
+        select(ProductReview).where(
+            ProductReview.product_id == product_id,
+            ProductReview.user_id == user.id,
+        )
+    )
+    if review is None:
+        review = ProductReview(product_id=product_id, user_id=user.id)
+        db.add(review)
+    review.rating = payload.rating
+    review.content = payload.content
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        review = db.scalar(
+            select(ProductReview).where(
+                ProductReview.product_id == product_id,
+                ProductReview.user_id == user.id,
+            )
+        )
+        if review is None:
+            raise HTTPException(status_code=409, detail="Unable to save review") from None
+        review.rating = payload.rating
+        review.content = payload.content
+        db.commit()
+    db.refresh(review)
+    return ProductReviewRead(
+        id=review.id,
+        product_id=review.product_id,
+        rating=review.rating,
+        content=review.content,
+        author_name=user.display_name or f"用户{user.id}",
+        created_at=review.created_at,
+        updated_at=review.updated_at,
+    )
+
+
+@app.get("/api/favorites", response_model=list[ProductRead])
+def list_favorite_products(db: DbSession, user: CurrentUser):
+    return list(
+        db.scalars(
+            select(Product)
+            .join(ProductFavorite, ProductFavorite.product_id == Product.id)
+            .options(selectinload(Product.seller).selectinload(User.store))
+            .where(ProductFavorite.user_id == user.id, Product.is_active.is_(True))
+            .order_by(ProductFavorite.created_at.desc())
+        )
+    )
+
+
+@app.put("/api/products/{product_id}/favorite", response_model=FavoriteStatus)
+def add_product_favorite(product_id: int, db: DbSession, user: CurrentUser):
+    product = db.scalar(select(Product.id).where(Product.id == product_id, Product.is_active.is_(True)))
+    if product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    favorite = db.scalar(
+        select(ProductFavorite).where(
+            ProductFavorite.product_id == product_id,
+            ProductFavorite.user_id == user.id,
+        )
+    )
+    if favorite is None:
+        db.add(ProductFavorite(product_id=product_id, user_id=user.id))
+        db.commit()
+    return FavoriteStatus(is_favorited=True)
+
+
+@app.delete("/api/products/{product_id}/favorite", response_model=FavoriteStatus)
+def remove_product_favorite(product_id: int, db: DbSession, user: CurrentUser):
+    db.execute(
+        delete(ProductFavorite).where(
+            ProductFavorite.product_id == product_id,
+            ProductFavorite.user_id == user.id,
+        )
+    )
+    db.commit()
+    return FavoriteStatus(is_favorited=False)
 
 
 @app.get("/api/admin/products", response_model=list[ProductRead])

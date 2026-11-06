@@ -33,6 +33,16 @@ export interface Product {
   store_address: string | null
 }
 
+export interface ProductReview {
+  id: number
+  product_id: number
+  rating: number
+  content: string
+  author_name: string
+  created_at: string
+  updated_at: string
+}
+
 export interface CartLine {
   product_id: number
   product_name: string
