@@ -15,11 +15,11 @@ dependencies = [
     "email-validator>=2.2,<3",
     "PyJWT[crypto]>=2.10,<3",
     "psycopg[binary]>=3.2,<4",
+    "httpx>=0.28,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "httpx>=0.28,<1",
     "pytest>=8.3,<9",
 ]
 

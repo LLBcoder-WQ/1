@@ -24,6 +24,15 @@ class LoginInput(BaseModel):
     password: str
 
 
+class EmailCodeRequest(BaseModel):
+    email: EmailStr
+
+
+class EmailCodeVerify(BaseModel):
+    email: EmailStr
+    code: str = Field(pattern=r"^[0-9]{6}$")
+
+
 class TokenRead(BaseModel):
     access_token: str
     token_type: str = "bearer"

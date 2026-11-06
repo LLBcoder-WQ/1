@@ -1,4 +1,6 @@
-from datetime import datetime, timezone
+import hmac
+import secrets
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Annotated
@@ -6,14 +8,25 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.config import get_settings
 from app.database import Base, engine, ensure_order_shipping_columns, get_db
 from app.dependencies import get_current_user, require_admin
-from app.models import CartItem, Category, Coupon, Order, OrderItem, Payment, Product, User
+from app.email_auth import create_email_code, hash_email_code, send_email_login_code
+from app.models import (
+    CartItem,
+    Category,
+    Coupon,
+    EmailLoginCode,
+    Order,
+    OrderItem,
+    Payment,
+    Product,
+    User,
+)
 from app.payments import PaymentGateway, get_payment_gateway
 from app.schemas import (
     CartItemInput,
@@ -26,6 +39,8 @@ from app.schemas import (
     CouponCreate,
     CouponRead,
     CouponUpdate,
+    EmailCodeRequest,
+    EmailCodeVerify,
     LoginInput,
     OrderRead,
     PaymentRead,
@@ -58,6 +73,9 @@ DbSession = Annotated[Session, Depends(get_db)]
 CurrentUser = Annotated[User, Depends(get_current_user)]
 AdminUser = Annotated[User, Depends(require_admin)]
 Money = Decimal("0.01")
+EMAIL_CODE_TTL_SECONDS = 10 * 60
+EMAIL_CODE_RESEND_SECONDS = 60
+EMAIL_CODE_MAX_ATTEMPTS = 5
 
 
 def money(value: Decimal) -> Decimal:
@@ -121,6 +139,104 @@ def login(payload: LoginInput, db: DbSession):
     user = db.scalar(select(User).where(User.email == payload.email.lower()))
     if user is None or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
+    return TokenRead(access_token=create_access_token(user.id, user.role))
+
+
+@app.post("/api/auth/email-code")
+def request_email_code(payload: EmailCodeRequest, db: DbSession):
+    email = str(payload.email).lower()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    code_record = db.get(EmailLoginCode, email)
+    if code_record is not None:
+        seconds_since_last_send = (now - code_record.last_sent_at).total_seconds()
+        if seconds_since_last_send < EMAIL_CODE_RESEND_SECONDS:
+            retry_after = max(1, EMAIL_CODE_RESEND_SECONDS - int(seconds_since_last_send))
+            raise HTTPException(
+                status_code=429,
+                detail=f"请稍后再试，{retry_after} 秒后可重新发送",
+                headers={"Retry-After": str(retry_after)},
+            )
+
+    code = create_email_code()
+    if code_record is None:
+        code_record = EmailLoginCode(email=email)
+        db.add(code_record)
+    code_record.code_hash = hash_email_code(email, code)
+    code_record.expires_at = now + timedelta(seconds=EMAIL_CODE_TTL_SECONDS)
+    code_record.last_sent_at = now
+    code_record.attempts = 0
+    db.commit()
+
+    try:
+        send_email_login_code(email, code)
+    except RuntimeError as error:
+        if str(error) == "Email login is not configured":
+            raise HTTPException(
+                status_code=503,
+                detail="邮箱登录尚未配置，请联系店铺管理员",
+            ) from None
+        raise HTTPException(
+            status_code=502,
+            detail="验证码邮件发送失败，请稍后重试",
+        ) from None
+
+    return {"detail": "验证码已发送"}
+
+
+@app.post("/api/auth/email-code/verify", response_model=TokenRead)
+def verify_email_code(payload: EmailCodeVerify, db: DbSession):
+    email = str(payload.email).lower()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    code_record = db.get(EmailLoginCode, email)
+    unauthorized = HTTPException(status_code=401, detail="验证码无效或已过期")
+    if code_record is None or code_record.expires_at <= now:
+        raise unauthorized
+    if code_record.attempts >= EMAIL_CODE_MAX_ATTEMPTS:
+        raise unauthorized
+    if not hmac.compare_digest(code_record.code_hash, hash_email_code(email, payload.code)):
+        db.execute(
+            update(EmailLoginCode)
+            .where(
+                EmailLoginCode.email == email,
+                EmailLoginCode.expires_at > now,
+                EmailLoginCode.attempts < EMAIL_CODE_MAX_ATTEMPTS,
+            )
+            .values(attempts=EmailLoginCode.attempts + 1)
+        )
+        db.commit()
+        raise unauthorized
+
+    claimed_email = db.execute(
+        delete(EmailLoginCode)
+        .where(
+            EmailLoginCode.email == email,
+            EmailLoginCode.code_hash == code_record.code_hash,
+            EmailLoginCode.expires_at > now,
+            EmailLoginCode.attempts < EMAIL_CODE_MAX_ATTEMPTS,
+        )
+        .returning(EmailLoginCode.email)
+    ).scalar_one_or_none()
+    if claimed_email is None:
+        db.rollback()
+        raise unauthorized
+
+    user = db.scalar(select(User).where(User.email == email))
+    if user is None:
+        user = User(
+            email=email,
+            password_hash=hash_password(secrets.token_urlsafe(32)),
+            role="customer",
+        )
+        db.add(user)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        user = db.scalar(select(User).where(User.email == email))
+        if user is None:
+            raise HTTPException(status_code=409, detail="登录失败，请重新获取验证码") from None
+    if user is None:
+        raise HTTPException(status_code=401, detail="验证码无效或已过期")
     return TokenRead(access_token=create_access_token(user.id, user.role))
 
 

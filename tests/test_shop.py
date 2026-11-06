@@ -345,6 +345,120 @@ def test_shipment_details_cannot_be_blank(client: TestClient):
     assert response.status_code == 422
 
 
+def test_email_code_creates_customer_and_is_one_time(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "app.main.send_email_login_code",
+        lambda email, code: sent.append((email, code)),
+    )
+
+    requested = client.post(
+        "/api/auth/email-code",
+        json={"email": "New.Customer@example.com"},
+    )
+    assert requested.status_code == 200
+    assert requested.json()["detail"] == "验证码已发送"
+    assert sent[0][0] == "new.customer@example.com"
+    assert len(sent[0][1]) == 6
+    assert sent[0][1].isdigit()
+
+    verified = client.post(
+        "/api/auth/email-code/verify",
+        json={"email": sent[0][0], "code": sent[0][1]},
+    )
+    assert verified.status_code == 200
+    profile = client.get(
+        "/api/auth/me",
+        headers={"Authorization": f"Bearer {verified.json()['access_token']}"},
+    )
+    assert profile.status_code == 200
+    assert profile.json() == {
+        "id": profile.json()["id"],
+        "email": "new.customer@example.com",
+        "role": "customer",
+    }
+
+    reused = client.post(
+        "/api/auth/email-code/verify",
+        json={"email": sent[0][0], "code": sent[0][1]},
+    )
+    assert reused.status_code == 401
+
+
+def test_email_code_resend_cooldown_and_attempt_limit(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    sent: list[str] = []
+    monkeypatch.setattr(
+        "app.main.send_email_login_code",
+        lambda email, code: sent.append(code),
+    )
+    email = "code-test@example.com"
+    assert client.post("/api/auth/email-code", json={"email": email}).status_code == 200
+    limited = client.post("/api/auth/email-code", json={"email": email})
+    assert limited.status_code == 429
+    assert limited.headers["retry-after"]
+
+    invalid_code = f"{(int(sent[0]) + 1) % 1_000_000:06d}"
+    for _ in range(5):
+        response = client.post(
+            "/api/auth/email-code/verify",
+            json={"email": email, "code": invalid_code},
+        )
+        assert response.status_code == 401
+
+    locked_out = client.post(
+        "/api/auth/email-code/verify",
+        json={"email": email, "code": sent[0]},
+    )
+    assert locked_out.status_code == 401
+    still_rate_limited = client.post("/api/auth/email-code", json={"email": email})
+    assert still_rate_limited.status_code == 429
+
+
+def test_email_code_can_sign_in_existing_admin(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    sent: list[str] = []
+    monkeypatch.setattr(
+        "app.main.send_email_login_code",
+        lambda email, code: sent.append(code),
+    )
+    assert client.post(
+        "/api/auth/email-code",
+        json={"email": "admin@example.com"},
+    ).status_code == 200
+    verified = client.post(
+        "/api/auth/email-code/verify",
+        json={"email": "admin@example.com", "code": sent[0]},
+    )
+    profile = client.get(
+        "/api/auth/me",
+        headers={"Authorization": f"Bearer {verified.json()['access_token']}"},
+    )
+    assert profile.json()["role"] == "admin"
+
+
+def test_email_code_returns_configuration_error_when_resend_is_unavailable(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def missing_configuration(email: str, code: str) -> None:
+        raise RuntimeError("Email login is not configured")
+
+    monkeypatch.setattr("app.main.send_email_login_code", missing_configuration)
+    response = client.post(
+        "/api/auth/email-code",
+        json={"email": "new-user@example.com"},
+    )
+    assert response.status_code == 503
+
+
 def test_frontend_is_served_when_a_production_build_is_present(client: TestClient):
     response = client.get("/")
 

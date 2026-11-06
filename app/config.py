@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     access_token_minutes: int = Field(default=60, gt=0, le=1440)
     environment: Literal["development", "production"] = "development"
     cors_origins: str = ""
+    resend_api_key: str = ""
+    email_from: str = ""
 
     @model_validator(mode="after")
     def validate_production_secret(self):

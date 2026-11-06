@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import {
   api,
   type AdminOrder,
@@ -12,8 +12,6 @@ import {
 } from './api'
 
 type View = 'shop' | 'orders' | 'admin'
-type AuthMode = 'login' | 'register'
-
 const products = ref<Product[]>([])
 const inventoryProducts = ref<Product[]>([])
 const categories = ref<Category[]>([])
@@ -32,7 +30,8 @@ const loading = ref(false)
 const busy = ref(false)
 const cartOpen = ref(false)
 const authOpen = ref(false)
-const authMode = ref<AuthMode>('login')
+const emailCodeSent = ref(false)
+const emailCodeCountdown = ref(0)
 const toast = ref('')
 const error = ref('')
 const couponCode = ref('')
@@ -45,7 +44,8 @@ const shippingForm = ref({
   postal_code: '',
 })
 
-const authForm = ref({ email: '', password: '' })
+const authForm = ref({ email: '', code: '' })
+let emailCodeTimer: number | undefined
 const productForm = ref({
   sku: '',
   name: '',
@@ -194,29 +194,41 @@ function scrollToCollection() {
   document.getElementById('collection')?.scrollIntoView({ behavior: 'smooth' })
 }
 
-function openAuth(mode: AuthMode = 'login') {
-  authMode.value = mode
+function openAuth() {
   authOpen.value = true
+}
+
+async function requestEmailCode() {
+  busy.value = true
+  try {
+    authForm.value.email = authForm.value.email.trim().toLowerCase()
+    await api<{ detail: string }>('/auth/email-code', {
+      method: 'POST',
+      body: { email: authForm.value.email },
+    })
+    emailCodeSent.value = true
+    emailCodeCountdown.value = 60
+    notify('验证码已发送，请查看邮箱')
+  } catch (reason) {
+    showError(reason instanceof Error ? reason.message : '验证码发送失败，请稍后重试')
+  } finally {
+    busy.value = false
+  }
 }
 
 async function submitAuth() {
   busy.value = true
   try {
-    if (authMode.value === 'register') {
-      await api<User>('/auth/register', {
-        method: 'POST',
-        body: { email: authForm.value.email, password: authForm.value.password },
-      })
-    }
-    const result = await api<{ access_token: string }>('/auth/login', {
+    const result = await api<{ access_token: string }>('/auth/email-code/verify', {
       method: 'POST',
-      body: { email: authForm.value.email, password: authForm.value.password },
+      body: { email: authForm.value.email, code: authForm.value.code },
     })
     token.value = result.access_token
     localStorage.setItem('shop-token', token.value)
     user.value = await api<User>('/auth/me', { token: token.value })
     authOpen.value = false
-    authForm.value.password = ''
+    authForm.value.code = ''
+    emailCodeSent.value = false
     await loadCart()
     if (isAdmin.value) await Promise.all([loadCoupons(), loadInventory(), loadAdminOrders()])
     notify(`欢迎回来，${user.value.email}`)
@@ -250,6 +262,11 @@ function signOut() {
   localStorage.removeItem('shop-token')
   currentView.value = 'shop'
   notify('已安全退出')
+}
+
+function changeAuthEmail() {
+  emailCodeSent.value = false
+  authForm.value.code = ''
 }
 
 async function addToCart(product: Product) {
@@ -461,7 +478,14 @@ function categoryNameOf(id: number | null) {
 }
 
 onMounted(async () => {
+  emailCodeTimer = window.setInterval(() => {
+    if (emailCodeCountdown.value > 0) emailCodeCountdown.value -= 1
+  }, 1000)
   await Promise.all([loadStore(), restoreSession()])
+})
+
+onUnmounted(() => {
+  if (emailCodeTimer !== undefined) window.clearInterval(emailCodeTimer)
 })
 </script>
 
@@ -760,9 +784,16 @@ onMounted(async () => {
         <section class="auth-card" aria-label="账户登录">
           <button class="close-button auth-close" aria-label="关闭登录窗口" @click="authOpen = false">×</button>
           <div class="auth-mark">拾</div><div class="eyebrow"><span class="eyebrow-line"></span> A PLACE FOR YOUR FINDS</div>
-          <h2>{{ authMode === 'login' ? '欢迎回来。' : '加入拾集。' }}</h2><p>{{ authMode === 'login' ? '登录后继续收藏喜欢的日常。' : '创建账户，开启你的拾集日常。' }}</p>
-          <form @submit.prevent="submitAuth"><label>邮箱地址<input v-model="authForm.email" type="email" autocomplete="email" required placeholder="hello@example.com" /></label><label>密码<input v-model="authForm.password" :type="'password'" :autocomplete="authMode === 'login' ? 'current-password' : 'new-password'" minlength="8" maxlength="128" required placeholder="至少 8 位" /></label><button class="button button-dark auth-submit" :disabled="busy">{{ authMode === 'login' ? '登录' : '创建账户' }} <span>↗</span></button></form>
-          <p class="auth-switch">{{ authMode === 'login' ? '还没有账户？' : '已经加入拾集？' }} <button @click="authMode = authMode === 'login' ? 'register' : 'login'">{{ authMode === 'login' ? '注册一个' : '直接登录' }}</button></p>
+          <h2>邮箱验证码登录。</h2><p>输入邮箱获取验证码，无需设置密码。首次验证后会自动创建账户。</p>
+          <form @submit.prevent="submitAuth">
+            <label>邮箱地址<input v-model="authForm.email" type="email" autocomplete="email" required maxlength="255" :readonly="emailCodeSent" placeholder="hello@example.com" /></label>
+            <template v-if="emailCodeSent">
+              <label>邮箱验证码<input v-model="authForm.code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required placeholder="输入 6 位验证码" /></label>
+              <div class="auth-code-actions"><button class="text-button" type="button" :disabled="busy || emailCodeCountdown > 0" @click="requestEmailCode">{{ emailCodeCountdown > 0 ? `${emailCodeCountdown} 秒后重新发送` : '重新发送验证码' }}</button><button class="text-button" type="button" @click="changeAuthEmail">修改邮箱</button></div>
+              <button class="button button-dark auth-submit" :disabled="busy">验证并登录 <span>↗</span></button>
+            </template>
+            <button v-else class="button button-dark auth-submit" type="button" :disabled="busy || !authForm.email">发送验证码 <span>↗</span></button>
+          </form>
           <p class="auth-admin-note">管理员账号请先通过后端 seed_admin 命令创建</p>
         </section>
       </div>

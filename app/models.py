@@ -17,6 +17,16 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class EmailLoginCode(Base):
+    __tablename__ = "email_login_codes"
+
+    email: Mapped[str] = mapped_column(String(255), primary_key=True)
+    code_hash: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    last_sent_at: Mapped[datetime] = mapped_column(DateTime)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+
+
 class Category(Base):
     __tablename__ = "categories"
 

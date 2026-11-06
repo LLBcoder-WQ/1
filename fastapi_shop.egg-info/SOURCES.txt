@@ -4,6 +4,7 @@ app/__init__.py
 app/config.py
 app/database.py
 app/dependencies.py
+app/email_auth.py
 app/main.py
 app/models.py
 app/payments.py
