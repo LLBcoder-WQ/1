@@ -56,21 +56,77 @@ def ensure_account_columns(target_engine: Engine = engine) -> None:
         "users": {
             "display_name": "VARCHAR(100)",
             "avatar_url": "VARCHAR(1000)",
+            "is_suspended": "BOOLEAN NOT NULL DEFAULT FALSE",
         },
         "products": {
             "image_url": "VARCHAR(1000)",
             "seller_id": "INTEGER REFERENCES users(id) ON DELETE SET NULL",
         },
+        "order_items": {
+            "seller_id": "INTEGER REFERENCES users(id) ON DELETE SET NULL",
+        },
+        "product_reviews": {
+            "is_visible": "BOOLEAN NOT NULL DEFAULT TRUE",
+        },
     }
     with target_engine.begin() as connection:
         inspector = inspect(connection)
+        tables = set(inspector.get_table_names())
         for table_name, columns in additions.items():
+            if table_name not in tables:
+                continue
             existing = {column["name"] for column in inspector.get_columns(table_name)}
             for column_name, column_type in columns.items():
                 if column_name not in existing:
                     connection.execute(
                         text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
                     )
+        if "order_items" in inspect(connection).get_table_names():
+            connection.execute(
+                text(
+                    "UPDATE order_items SET seller_id = "
+                    "(SELECT seller_id FROM products WHERE products.id = order_items.product_id) "
+                    "WHERE seller_id IS NULL"
+                )
+            )
+
+
+def ensure_merchant_fulfillments(target_engine: Engine = engine) -> None:
+    with target_engine.begin() as connection:
+        tables = set(inspect(connection).get_table_names())
+        if not {"merchant_fulfillments", "order_items", "orders"} <= tables:
+            return
+        connection.execute(
+            text(
+                """
+                INSERT INTO merchant_fulfillments (
+                    order_id, seller_id, status, shipping_carrier, tracking_number,
+                    shipped_at, delivered_at
+                )
+                SELECT DISTINCT
+                    orders.id,
+                    order_items.seller_id,
+                    CASE
+                        WHEN orders.status IN ('paid', 'processing') THEN 'processing'
+                        ELSE orders.status
+                    END,
+                    orders.shipping_carrier,
+                    orders.tracking_number,
+                    orders.shipped_at,
+                    orders.delivered_at
+                FROM orders
+                JOIN order_items ON order_items.order_id = orders.id
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM merchant_fulfillments
+                    WHERE merchant_fulfillments.order_id = orders.id
+                      AND (
+                        merchant_fulfillments.seller_id = order_items.seller_id
+                        OR (merchant_fulfillments.seller_id IS NULL AND order_items.seller_id IS NULL)
+                      )
+                )
+                """
+            )
+        )
 
 
 def get_db() -> Generator[Session, None, None]:

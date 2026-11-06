@@ -4,6 +4,7 @@ export interface User {
   role: 'customer' | 'merchant' | 'admin'
   display_name: string | null
   avatar_url: string | null
+  is_suspended: boolean
 }
 
 export interface MerchantStore {
@@ -41,6 +42,35 @@ export interface ProductReview {
   author_name: string
   created_at: string
   updated_at: string
+  can_edit: boolean
+}
+
+export interface ProductReviewSummary {
+  total: number
+  average_rating: number | null
+}
+
+export interface AdminMerchant {
+  id: number
+  email: string
+  role: 'merchant'
+  display_name: string | null
+  avatar_url: string | null
+  is_suspended: boolean
+  store_name: string | null
+  store_address: string | null
+}
+
+export interface AdminReviewReport {
+  id: number
+  review_id: number
+  product_id: number
+  product_name: string
+  reporter_name: string
+  reason: string
+  status: 'open' | 'resolved' | 'dismissed'
+  review_content: string
+  created_at: string
 }
 
 export interface CartLine {
@@ -80,6 +110,34 @@ export interface Order {
   shipped_at: string | null
   delivered_at: string | null
   created_at: string
+  items: OrderItem[]
+  fulfillments: MerchantFulfillment[]
+}
+
+export interface MerchantFulfillment {
+  id: number
+  seller_id: number | null
+  store_name: string
+  status: string
+  shipping_carrier: string | null
+  tracking_number: string | null
+  shipped_at: string | null
+  delivered_at: string | null
+  items: OrderItem[]
+}
+
+export interface MerchantOrder {
+  fulfillment_id: number
+  order_id: number
+  status: string
+  created_at: string
+  customer_email: string
+  recipient_name: string | null
+  recipient_phone: string | null
+  shipping_region: string | null
+  shipping_address: string | null
+  postal_code: string | null
+  subtotal: string
   items: OrderItem[]
 }
 

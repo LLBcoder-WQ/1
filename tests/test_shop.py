@@ -1,12 +1,19 @@
 import pytest
 from fastapi.testclient import TestClient
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlalchemy import create_engine, inspect, text
 
 from app.config import Settings
-from app.database import Base, ensure_account_columns, ensure_order_shipping_columns, get_db
-from app.main import app
+from app.database import (
+    Base,
+    ensure_account_columns,
+    ensure_merchant_fulfillments,
+    ensure_order_shipping_columns,
+    get_db,
+)
+from app.main import CORS_ALLOWED_METHODS, app
 from app.models import Order, User
 from app.security import hash_password
 from app.storage import MAX_IMAGE_SIZE, upload_public_image
@@ -64,6 +71,27 @@ def delivery_details() -> dict[str, str]:
         "shipping_address": "文三路 100 号 2 幢 301 室",
         "postal_code": "310012",
     }
+
+
+def test_favorite_put_is_allowed_by_cross_origin_preflight():
+    cors_app = CORSMiddleware(
+        app,
+        allow_origins=["https://shop.example"],
+        allow_methods=CORS_ALLOWED_METHODS,
+        allow_headers=["Authorization", "Content-Type"],
+    )
+    with TestClient(cors_app) as cors_client:
+        response = cors_client.options(
+            "/api/products/1/favorite",
+            headers={
+                "Origin": "https://shop.example",
+                "Access-Control-Request-Method": "PUT",
+                "Access-Control-Request-Headers": "authorization",
+            },
+        )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "https://shop.example"
+    assert "PUT" in response.headers["access-control-allow-methods"]
 
 
 def test_checkout_applies_coupon_deducts_stock_and_clears_cart(client: TestClient):
@@ -298,10 +326,83 @@ def test_legacy_account_columns_are_added_idempotently():
         ensure_account_columns(legacy_engine)
         user_columns = {column["name"] for column in inspect(legacy_engine).get_columns("users")}
         product_columns = {column["name"] for column in inspect(legacy_engine).get_columns("products")}
-        assert {"display_name", "avatar_url"}.issubset(user_columns)
+        assert {"display_name", "avatar_url", "is_suspended"}.issubset(user_columns)
         assert {"image_url", "seller_id"}.issubset(product_columns)
     finally:
         legacy_engine.dispose()
+
+
+def test_legacy_order_items_get_seller_snapshot_and_fulfillments_idempotently():
+    legacy_engine = create_engine("sqlite://")
+    try:
+        with legacy_engine.begin() as connection:
+            connection.execute(text("CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR(255))"))
+            connection.execute(text("CREATE TABLE products (id INTEGER PRIMARY KEY, seller_id INTEGER)"))
+            connection.execute(text("CREATE TABLE orders (id INTEGER PRIMARY KEY, status VARCHAR(20))"))
+            connection.execute(
+                text("CREATE TABLE order_items (id INTEGER PRIMARY KEY, order_id INTEGER, product_id INTEGER)")
+            )
+            connection.execute(
+                text(
+                    "CREATE TABLE merchant_fulfillments ("
+                    "id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL, seller_id INTEGER, "
+                    "status VARCHAR(20), shipping_carrier VARCHAR(80), tracking_number VARCHAR(100), "
+                    "shipped_at TIMESTAMP, delivered_at TIMESTAMP, UNIQUE(order_id, seller_id))"
+                )
+            )
+            connection.execute(text("INSERT INTO users (id, email) VALUES (9, 'seller@example.com')"))
+            connection.execute(text("INSERT INTO products (id, seller_id) VALUES (3, 9)"))
+            connection.execute(text("INSERT INTO orders (id, status) VALUES (5, 'pending_payment')"))
+            connection.execute(text("INSERT INTO order_items (id, order_id, product_id) VALUES (7, 5, 3)"))
+
+        ensure_account_columns(legacy_engine)
+        ensure_order_shipping_columns(legacy_engine)
+        ensure_merchant_fulfillments(legacy_engine)
+        ensure_merchant_fulfillments(legacy_engine)
+
+        with legacy_engine.connect() as connection:
+            item_seller_id = connection.execute(
+                text("SELECT seller_id FROM order_items WHERE id = 7")
+            ).scalar_one()
+            fulfillment_count = connection.execute(
+                text("SELECT count(*) FROM merchant_fulfillments WHERE order_id = 5")
+            ).scalar_one()
+            assert item_seller_id == 9
+            assert fulfillment_count == 1
+    finally:
+        legacy_engine.dispose()
+
+
+def test_product_search_and_favorite_lists_are_paginated(client: TestClient):
+    admin = auth(client, "admin@example.com", "admin-password")
+    buyer = auth(client, "buyer@example.com", "buyer-password")
+    product_ids = []
+    for index in range(3):
+        response = client.post(
+            "/api/products",
+            json={
+                "sku": f"PAGE-{index}",
+                "name": f"Paged item {index}",
+                "description": "special phrase" if index == 2 else "",
+                "price": "4.00",
+                "stock": 1,
+            },
+            headers=admin,
+        )
+        assert response.status_code == 201
+        product_ids.append(response.json()["id"])
+        assert client.put(
+            f"/api/products/{response.json()['id']}/favorite",
+            headers=buyer,
+        ).status_code == 200
+
+    first_page = client.get("/api/products?limit=2&offset=0")
+    second_page = client.get("/api/products?limit=2&offset=2")
+    assert len(first_page.json()) == 2
+    assert [item["id"] for item in second_page.json()] == [product_ids[2]]
+    assert [item["id"] for item in client.get("/api/products?search=special%20phrase").json()] == [product_ids[2]]
+    assert len(client.get("/api/favorites?limit=2&offset=0", headers=buyer).json()) == 2
+    assert [item["id"] for item in client.get("/api/favorites?limit=2&offset=2", headers=buyer).json()] == [product_ids[0]]
 
 
 def test_shipping_is_blocked_until_payment_and_tracking_is_visible_to_customer(client: TestClient):
@@ -560,6 +661,22 @@ def test_product_reviews_are_public_and_upsert_per_customer(client: TestClient):
         json={"rating": 6, "content": "Invalid rating"},
         headers=buyer,
     ).status_code == 422
+    assert client.post(
+        f"/api/products/{product_id}/reviews",
+        json={"rating": 4, "content": "Not purchased yet"},
+        headers=buyer,
+    ).status_code == 403
+    assert client.post(
+        "/api/cart/items",
+        json={"product_id": product_id, "quantity": 1},
+        headers=buyer,
+    ).status_code == 200
+    order = client.post("/api/orders", json=delivery_details(), headers=buyer)
+    assert order.status_code == 201
+    assert client.post(
+        f"/api/orders/{order.json()['id']}/demo-payment",
+        headers=buyer,
+    ).status_code == 200
     first = client.post(
         f"/api/products/{product_id}/reviews",
         json={"rating": 4, "content": "  Nice quality  "},
@@ -582,6 +699,162 @@ def test_product_reviews_are_public_and_upsert_per_customer(client: TestClient):
         f"/api/products/{product_id}/reviews",
         json={"rating": 3, "content": "Guest review"},
     ).status_code == 401
+    assert client.get(
+        f"/api/products/{product_id}/reviews/summary"
+    ).json() == {"total": 1, "average_rating": 5.0}
+    assert client.delete(
+        f"/api/products/{product_id}/reviews/{reviews.json()[0]['id']}",
+        headers=admin,
+    ).status_code == 403
+    assert client.delete(
+        f"/api/products/{product_id}/reviews/{reviews.json()[0]['id']}",
+        headers=buyer,
+    ).status_code == 204
+    assert client.get(
+        f"/api/products/{product_id}/reviews/summary"
+    ).json() == {"total": 0, "average_rating": None}
+
+
+def test_merchant_fulfillment_is_isolated_and_customer_can_confirm_delivery(client: TestClient):
+    merchant_response = client.post(
+        "/api/auth/register",
+        json={
+            "email": "merchant@example.com",
+            "password": "merchant-password",
+            "role": "merchant",
+            "store_name": "Merchant Store",
+        },
+    )
+    assert merchant_response.status_code == 201
+    merchant_id = merchant_response.json()["id"]
+    merchant = auth(client, "merchant@example.com", "merchant-password", role="merchant")
+    buyer = auth(client, "buyer@example.com", "buyer-password")
+    product = client.post(
+        "/api/products",
+        json={"sku": "MERCHANT-ORDER", "name": "Merchant item", "price": "12.00", "stock": 3},
+        headers=merchant,
+    ).json()
+    assert client.post(
+        "/api/cart/items",
+        json={"product_id": product["id"], "quantity": 2},
+        headers=buyer,
+    ).status_code == 200
+    order = client.post("/api/orders", json=delivery_details(), headers=buyer).json()
+    assert len(order["fulfillments"]) == 1
+    assert order["fulfillments"][0]["seller_id"] == merchant_id
+    assert client.post(
+        f"/api/orders/{order['id']}/demo-payment",
+        headers=buyer,
+    ).json()["status"] == "processing"
+    merchant_orders = client.get("/api/merchant/orders", headers=merchant)
+    assert merchant_orders.status_code == 200
+    assert merchant_orders.json()[0]["order_id"] == order["id"]
+    assert merchant_orders.json()[0]["subtotal"] == "24.00"
+    other_registration = client.post(
+        "/api/auth/register",
+        json={
+            "email": "other-merchant@example.com",
+            "password": "other-password",
+            "role": "merchant",
+            "store_name": "Other Store",
+        },
+    )
+    assert other_registration.status_code == 201
+    other_merchant = auth(client, "other-merchant@example.com", "other-password", role="merchant")
+    assert client.get("/api/merchant/orders", headers=other_merchant).json() == []
+    assert client.post(
+        f"/api/merchant/orders/{order['id']}/shipment",
+        json={"shipping_carrier": "顺丰", "tracking_number": "UNAUTHORIZED"},
+        headers=other_merchant,
+    ).status_code == 404
+
+    shipment = client.post(
+        f"/api/merchant/orders/{order['id']}/shipment",
+        json={"shipping_carrier": "顺丰", "tracking_number": "TRACK-1"},
+        headers=merchant,
+    )
+    assert shipment.status_code == 200
+    assert shipment.json()["status"] == "shipped"
+    updated_order = client.get(f"/api/orders/{order['id']}", headers=buyer).json()
+    fulfillment = updated_order["fulfillments"][0]
+    assert fulfillment["tracking_number"] == "TRACK-1"
+    delivered = client.post(
+        f"/api/orders/{order['id']}/fulfillments/{fulfillment['id']}/delivery",
+        headers=buyer,
+    )
+    assert delivered.status_code == 200
+    assert delivered.json()["status"] == "delivered"
+
+    assert client.get("/api/merchant/orders", headers=auth(client, "admin@example.com", "admin-password")).status_code == 403
+
+
+def test_review_report_moderation_and_merchant_suspension(client: TestClient):
+    admin = auth(client, "admin@example.com", "admin-password")
+    buyer = auth(client, "buyer@example.com", "buyer-password")
+    registration = client.post(
+        "/api/auth/register",
+        json={
+            "email": "moderated-merchant@example.com",
+            "password": "merchant-password",
+            "role": "merchant",
+            "store_name": "Reviewable Store",
+        },
+    )
+    merchant = auth(client, "moderated-merchant@example.com", "merchant-password", role="merchant")
+    merchant_id = registration.json()["id"]
+    product = client.post(
+        "/api/products",
+        json={"sku": "MODERATED", "name": "Moderated item", "price": "5.00", "stock": 2},
+        headers=merchant,
+    ).json()
+    assert client.post(
+        "/api/cart/items",
+        json={"product_id": product["id"], "quantity": 1},
+        headers=buyer,
+    ).status_code == 200
+    order = client.post("/api/orders", json=delivery_details(), headers=buyer).json()
+    client.post(f"/api/orders/{order['id']}/demo-payment", headers=buyer)
+    review = client.post(
+        f"/api/products/{product['id']}/reviews",
+        json={"rating": 1, "content": "Review to report"},
+        headers=buyer,
+    ).json()
+    report = client.post(
+        f"/api/products/{product['id']}/reviews/{review['id']}/reports",
+        json={"reason": "Contains inappropriate content"},
+        headers=admin,
+    )
+    assert report.status_code == 201
+    reports = client.get("/api/admin/review-reports", headers=admin)
+    assert reports.json()[0]["status"] == "open"
+    resolved = client.patch(
+        f"/api/admin/review-reports/{report.json()['id']}",
+        json={"status": "resolved"},
+        headers=admin,
+    )
+    assert resolved.status_code == 200
+    assert client.get(f"/api/products/{product['id']}/reviews").json() == []
+
+    suspended = client.patch(
+        f"/api/admin/merchants/{merchant_id}/status",
+        json={"is_suspended": True},
+        headers=admin,
+    )
+    assert suspended.status_code == 200
+    assert suspended.json()["is_suspended"] is True
+    assert client.get("/api/auth/me", headers=merchant).status_code == 401
+    assert client.post(
+        "/api/auth/login",
+        json={"email": "moderated-merchant@example.com", "password": "merchant-password", "role": "merchant"},
+    ).status_code == 403
+    assert client.get("/api/products").json() == []
+    restored = client.patch(
+        f"/api/admin/merchants/{merchant_id}/status",
+        json={"is_suspended": False},
+        headers=admin,
+    )
+    assert restored.status_code == 200
+    assert client.get("/api/products").json()[0]["id"] == product["id"]
 
 
 def test_product_favorites_are_private_and_idempotent(client: TestClient):

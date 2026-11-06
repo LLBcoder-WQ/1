@@ -29,6 +29,44 @@ class UserRead(BaseModel):
     role: str
     display_name: str | None
     avatar_url: str | None
+    is_suspended: bool = False
+
+
+class AdminMerchantRead(UserRead):
+    store_name: str | None
+    store_address: str | None
+
+
+class AdminMerchantStatus(BaseModel):
+    is_suspended: bool
+
+
+class AdminReviewReportRead(BaseModel):
+    id: int
+    review_id: int
+    product_id: int
+    product_name: str
+    reporter_name: str
+    reason: str
+    status: str
+    review_content: str
+    created_at: datetime
+
+
+class ProductReviewReportCreate(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+
+    @field_validator("reason")
+    @classmethod
+    def normalize_reason(cls, value: str) -> str:
+        reason = value.strip()
+        if not reason:
+            raise ValueError("report reason cannot be blank")
+        return reason
+
+
+class ProductReviewReportUpdate(BaseModel):
+    status: Literal["resolved", "dismissed"]
 
 
 class LoginInput(BaseModel):
@@ -125,6 +163,12 @@ class ProductReviewRead(BaseModel):
     author_name: str
     created_at: datetime
     updated_at: datetime
+    can_edit: bool = False
+
+
+class ProductReviewSummary(BaseModel):
+    total: int
+    average_rating: float | None
 
 
 class FavoriteStatus(BaseModel):
@@ -292,6 +336,20 @@ class OrderItemRead(BaseModel):
     quantity: int
 
 
+class MerchantFulfillmentRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    seller_id: int | None
+    store_name: str
+    status: str
+    shipping_carrier: str | None
+    tracking_number: str | None
+    shipped_at: datetime | None
+    delivered_at: datetime | None
+    items: list[OrderItemRead]
+
+
 class OrderRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -311,6 +369,22 @@ class OrderRead(BaseModel):
     shipped_at: datetime | None
     delivered_at: datetime | None
     created_at: datetime
+    items: list[OrderItemRead]
+    fulfillments: list[MerchantFulfillmentRead] = Field(default_factory=list)
+
+
+class MerchantOrderRead(BaseModel):
+    fulfillment_id: int
+    order_id: int
+    status: str
+    created_at: datetime
+    customer_email: str
+    recipient_name: str | None
+    recipient_phone: str | None
+    shipping_region: str | None
+    shipping_address: str | None
+    postal_code: str | None
+    subtotal: Decimal
     items: list[OrderItemRead]
 
 

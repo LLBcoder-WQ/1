@@ -16,6 +16,7 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(20), default="customer")
     display_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     avatar_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    is_suspended: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     store: Mapped["MerchantStore | None"] = relationship(back_populates="owner", cascade="all, delete-orphan")
@@ -63,6 +64,7 @@ class ProductReview(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     rating: Mapped[int] = mapped_column(Integer)
     content: Mapped[str] = mapped_column(Text)
+    is_visible: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
@@ -70,6 +72,21 @@ class ProductReview(Base):
         onupdate=lambda: datetime.now(timezone.utc),
     )
     user: Mapped[User] = relationship()
+    product: Mapped[Product] = relationship()
+
+
+class ProductReviewReport(Base):
+    __tablename__ = "product_review_reports"
+    __table_args__ = (UniqueConstraint("review_id", "reporter_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    review_id: Mapped[int] = mapped_column(ForeignKey("product_reviews.id", ondelete="CASCADE"), index=True)
+    reporter_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    reason: Mapped[str] = mapped_column(String(500))
+    status: Mapped[str] = mapped_column(String(20), default="open")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    review: Mapped[ProductReview] = relationship()
+    reporter: Mapped[User] = relationship()
 
 
 class ProductFavorite(Base):
@@ -139,6 +156,9 @@ class Order(Base):
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     items: Mapped[list["OrderItem"]] = relationship(back_populates="order", cascade="all, delete-orphan")
+    fulfillments: Mapped[list["MerchantFulfillment"]] = relationship(
+        back_populates="order", cascade="all, delete-orphan"
+    )
 
 
 class OrderItem(Base):
@@ -147,10 +167,43 @@ class OrderItem(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"))
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"))
+    seller_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     product_name: Mapped[str] = mapped_column(String(200))
     unit_price: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     quantity: Mapped[int] = mapped_column(Integer)
     order: Mapped[Order] = relationship(back_populates="items")
+
+
+class MerchantFulfillment(Base):
+    __tablename__ = "merchant_fulfillments"
+    __table_args__ = (UniqueConstraint("order_id", "seller_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"), index=True)
+    seller_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    status: Mapped[str] = mapped_column(String(20), default="pending_payment")
+    shipping_carrier: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    tracking_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    shipped_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    order: Mapped[Order] = relationship(back_populates="fulfillments")
+    seller: Mapped[User | None] = relationship()
+
+    @property
+    def store_name(self) -> str:
+        if self.seller is not None and self.seller.store is not None:
+            return self.seller.store.name
+        return "平台商品"
+
+    @property
+    def items(self) -> list[OrderItem]:
+        if self.order is None:
+            return []
+        return [item for item in self.order.items if item.seller_id == self.seller_id]
 
 
 class Payment(Base):

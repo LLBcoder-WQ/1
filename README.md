@@ -24,7 +24,7 @@ uvicorn app.main:app --reload
 
 头像和商品图片使用 Supabase Storage 保存。上传支持 JPG、PNG 和 WebP，单张最大 5 MB。
 
-商品卡片可以打开详情，查看店铺、库存和用户评价；登录后可以收藏商品、发布评分与评论。每个账号对同一商品保留一条可更新的评价，评论对访客可见；收藏仅账号本人可查看。注销账号后，收藏会清除，历史评论会匿名保留。
+商品卡片可以打开详情，查看店铺、库存和用户评价；登录后可以收藏商品。只有购买并完成演示付款的顾客可以评价，每个账号对同一商品保留一条可更新的评价，作者可以编辑或删除自己的评价。访客可查看公开评论，登录用户可以举报评论，管理员可以隐藏违规评论或驳回举报。商品、收藏和评论列表均支持分页。注销账号后，收藏会清除，历史评论会匿名保留。
 
 ## 主要接口
 
@@ -37,14 +37,22 @@ uvicorn app.main:app --reload
 - `POST /api/products/{id}/image`：上传商品图片
 - `GET /api/categories`、`POST /api/categories`：查询和创建商品分类（创建需要管理员权限）
 - `GET /api/products`、`GET /api/products/{id}`：查询商品
-- `GET /api/products/{id}/reviews`、`POST /api/products/{id}/reviews`：查看和发布/更新商品评价
-- `GET /api/favorites`、`PUT/DELETE /api/products/{id}/favorite`：查看和管理当前账号的收藏
+- `GET /api/products/{id}/reviews`、`GET /api/products/{id}/reviews/summary`：分页查看评论和评价统计
+- `POST /api/products/{id}/reviews`、`DELETE /api/products/{id}/reviews/{review_id}`：购买并演示付款后发布/更新评价；作者可删除自己的评论
+- `POST /api/products/{id}/reviews/{review_id}/reports`：举报评论（需要登录）
+- `GET/PATCH /api/admin/review-reports`：管理员查看举报并隐藏评论或驳回举报
+- `GET /api/favorites`、`PUT/DELETE /api/products/{id}/favorite`：分页查看和管理当前账号的收藏
 - `POST /api/products`、`PATCH /api/products/{id}`：商家管理自己的商品，管理员可管理全部商品
 - `GET /api/merchant/products`：商家查询自己的商品，管理员查询全部商品
 - `GET /api/admin/products`：查询全部库存商品（需要管理员权限）
 - `GET /api/admin/orders`：查询最近订单，默认最多 50 条、上限 100 条，并包含买家邮箱（需要管理员权限）
 - `POST /api/admin/orders/{id}/shipment`：登记承运商和物流单号（需要管理员权限）
 - `POST /api/admin/orders/{id}/delivery`：将已发货订单标记为已送达（需要管理员权限）
+- `GET /api/merchant/orders`：分页查看仅属于当前商家的履约订单
+- `POST /api/merchant/orders/{id}/shipment`：商家仅能为自己的商品登记发货
+- `POST /api/orders/{id}/demo-payment`：顾客确认演示付款，不产生真实收款
+- `POST /api/orders/{id}/fulfillments/{fulfillment_id}/delivery`：顾客确认对应店铺商品已收货
+- `GET /api/admin/merchants`、`PATCH /api/admin/merchants/{merchant_id}/status`：管理员查看商家并暂停或恢复商家账号
 - `GET /api/cart`、`POST /api/cart/items`、`DELETE /api/cart/items/{product_id}`：查看和修改购物车
 - `POST /api/coupons`、`GET /api/coupons`、`PATCH /api/coupons/{id}`：管理优惠码（需要管理员权限）
 - `POST /api/orders`：创建订单并填写配送信息
@@ -56,9 +64,9 @@ uvicorn app.main:app --reload
 
 结账需要收件人姓名、电话、省市区和详细地址；邮政编码为可选项。应用启动时会为旧版 `orders` 表补上配送字段，不会删除旧订单；旧订单的配送信息为空。
 
-管理员可以为已付款或待发货订单登记物流，并将运输中的订单标记为已送达。未付款或已取消的订单不能登记发货。当前演示支付不会将订单标记为已付款，因此无法通过正常流程继续发货。物流信息需要手动维护，不会自动同步快递状态。
+下单时会按商品所属店铺拆分履约记录；商家只能查看和发出自己店铺的商品，不会因此修改其他店铺的物流状态。管理员仍可协助整笔订单的发货和签收管理。顾客通过「演示确认付款」将订单推进到待发货状态，付款状态只用于学习和流程演示，不会收款。顾客可以按店铺确认收货。物流信息需要手动维护，不会自动同步快递状态。
 
-演示支付仅创建待处理的支付记录，不会收取款项、确认支付或提供支付确认接口。项目不接入真实支付。
+项目不接入真实支付、真实支付网关或真实收款；演示确认不能作为实际交易或收款凭据。
 
 ## 部署到 Render、Vercel 和 Supabase
 
@@ -80,7 +88,7 @@ uvicorn app.main:app --reload
    python -m app.seed_admin admin@example.com
    ```
 
-   命令会提示输入密码，输入内容不会显示。访问 `/health` 可检查 API 是否正常。应用首次启动时会自动创建缺失的表，并为旧订单表添加配送字段。
+   命令会提示输入密码，输入内容不会显示。访问 `/health` 可检查 API 是否正常。应用启动时会自动创建缺失的表，并对旧数据库进行幂等升级：补充所需账户、订单商品和评论字段，并为旧订单生成店铺履约记录。升级不会删除订单或评论。
 
 仓库中的 Render Blueprint 使用免费方案，服务在闲置时可能休眠。Supabase 数据库和 Storage 独立于 Render 服务运行。请定期备份数据库并测试恢复流程；免费方案的可用性、连接数和备份保留规则以服务商当前政策为准。妥善保管 Supabase 数据库密码和 Render 密钥。演示支付不会收款，也不会确认付款。
 

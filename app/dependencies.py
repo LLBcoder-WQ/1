@@ -33,8 +33,32 @@ def get_current_user(
     except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
         raise unauthorized from None
     user = db.get(User, user_id)
-    if user is None or user.role == "deleted":
+    if user is None or user.role == "deleted" or user.is_suspended:
         raise unauthorized
+    return user
+
+
+def get_optional_current_user(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
+    db: Annotated[Session, Depends(get_db)],
+) -> User | None:
+    if credentials is None:
+        return None
+    try:
+        payload = jwt.decode(
+            credentials.credentials,
+            get_settings().secret_key,
+            algorithms=["HS256"],
+        )
+        user = db.get(User, int(payload["sub"]))
+    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid access token",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from None
+    if user is None or user.role == "deleted" or user.is_suspended:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or inactive account")
     return user
 
 
