@@ -53,6 +53,13 @@ class AdminReviewReportRead(BaseModel):
     created_at: datetime
 
 
+class AdminReviewReportPageRead(BaseModel):
+    items: list[AdminReviewReportRead]
+    total: int
+    limit: int
+    offset: int
+
+
 class ProductReviewReportCreate(BaseModel):
     reason: str = Field(min_length=1, max_length=500)
 
@@ -359,6 +366,7 @@ class OrderRead(BaseModel):
     discount: Decimal
     total: Decimal
     coupon_code: str | None
+    expires_at: datetime | None
     recipient_name: str | None
     recipient_phone: str | None
     shipping_region: str | None
@@ -390,6 +398,13 @@ class MerchantOrderRead(BaseModel):
 
 class AdminOrderRead(OrderRead):
     customer_email: str
+
+
+class AdminOrderPageRead(BaseModel):
+    items: list[AdminOrderRead]
+    total: int
+    limit: int
+    offset: int
 
 
 class PaymentRead(BaseModel):

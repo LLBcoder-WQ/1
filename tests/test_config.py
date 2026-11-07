@@ -24,6 +24,16 @@ def test_access_token_lifetime_must_be_positive_and_bounded():
         Settings(access_token_minutes=1441)
 
 
+def test_order_payment_expiry_is_bounded():
+    assert Settings().order_payment_expiry_minutes == 30
+
+    with pytest.raises(ValidationError):
+        Settings(order_payment_expiry_minutes=4)
+
+    with pytest.raises(ValidationError):
+        Settings(order_payment_expiry_minutes=1441)
+
+
 @pytest.mark.parametrize(
     ("database_url", "expected"),
     [

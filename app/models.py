@@ -17,9 +17,22 @@ class User(Base):
     display_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     avatar_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     is_suspended: Mapped[bool] = mapped_column(Boolean, default=False)
+    token_version: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     store: Mapped["MerchantStore | None"] = relationship(back_populates="owner", cascade="all, delete-orphan")
+
+
+class AuthAttempt(Base):
+    __tablename__ = "auth_attempts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    key_hash: Mapped[str] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        index=True,
+    )
 
 
 class Category(Base):
@@ -145,6 +158,7 @@ class Order(Base):
     discount: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=Decimal("0"))
     total: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     coupon_code: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     recipient_name: Mapped[str | None] = mapped_column(String(80), nullable=True)
     recipient_phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
     shipping_region: Mapped[str | None] = mapped_column(String(120), nullable=True)

@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   ApiError,
   api,
   type AdminOrder,
   type AdminMerchant,
+  type AdminOrderPage,
   type AdminReviewReport,
+  type AdminReviewReportPage,
   type Cart,
   type Category,
   type Coupon,
@@ -20,6 +22,39 @@ import {
 
 type View = 'shop' | 'favorites' | 'orders' | 'admin'
 type AccountRole = 'customer' | 'merchant'
+const heroSlides = [
+  {
+    eyebrow: 'SLOW LIVING, WELL MADE',
+    title: '把日常过成',
+    accent: '喜欢的样子。',
+    description: '从一只手作花瓶开始，让平凡日子也有温柔光景。',
+    note: 'THE EVERYDAY EDIT',
+    stamp: '好物 · 慢选',
+    scene: 'ceramics',
+  },
+  {
+    eyebrow: 'A MOMENT TO UNWIND',
+    title: '为一盏暖灯',
+    accent: '留住好时光。',
+    description: '一杯茶，一段闲暇，把生活调成喜欢的节奏。',
+    note: 'A LITTLE PAUSE',
+    stamp: '一盏 · 一刻',
+    scene: 'tea',
+  },
+  {
+    eyebrow: 'GROW AT YOUR OWN PACE',
+    title: '让每一天',
+    accent: '都有小确幸。',
+    description: '自然的气息与恰好的陪伴，点亮日常每个角落。',
+    note: 'A SOFTER EVERYDAY',
+    stamp: '自然 · 相伴',
+    scene: 'botanical',
+  },
+] as const
+const heroSlideIndex = ref(0)
+const heroPaused = ref(false)
+let heroRotationTimer = 0
+const currentHeroSlide = computed(() => heroSlides[heroSlideIndex.value]!)
 const products = ref<Product[]>([])
 const favoriteProducts = ref<Product[]>([])
 const inventoryProducts = ref<Product[]>([])
@@ -30,8 +65,16 @@ const adminOrders = ref<AdminOrder[]>([])
 const merchantOrders = ref<MerchantOrder[]>([])
 const adminMerchants = ref<AdminMerchant[]>([])
 const reviewReports = ref<AdminReviewReport[]>([])
+const reviewReportStatus = ref<'all' | 'open' | 'resolved' | 'dismissed'>('open')
+const reviewReportOffset = ref(0)
+const reviewReportTotal = ref(0)
+const reviewReportLimit = 20
 const merchantShipmentForms = ref<Record<number, { shipping_carrier: string; tracking_number: string }>>({})
-const orderFilter = ref<'all' | 'pending_payment' | 'paid' | 'processing' | 'shipped' | 'delivered' | 'cancelled'>('all')
+const orderFilter = ref<'all' | 'pending_payment' | 'paid' | 'processing' | 'shipped' | 'delivered' | 'cancelled' | 'expired'>('all')
+const adminOrderSearch = ref('')
+const adminOrderOffset = ref(0)
+const adminOrderTotal = ref(0)
+const adminOrderLimit = 20
 const shipmentForms = ref<Record<number, { shipping_carrier: string; tracking_number: string }>>({})
 const coupons = ref<Coupon[]>([])
 const user = ref<User | null>(null)
@@ -49,6 +92,8 @@ const reviewDraft = ref({ rating: 5, content: '' })
 const favoriteLoading = ref(false)
 const activeCategory = ref<number | null>(null)
 const search = ref('')
+const inventorySearch = ref('')
+const inventoryFilter = ref<'all' | 'active' | 'inactive' | 'low' | 'out'>('all')
 const productOffset = ref(0)
 const hasMoreProducts = ref(false)
 const favoriteOffset = ref(0)
@@ -107,14 +152,22 @@ const averageRatingStars = computed(() => {
   return '★'.repeat(roundedRating) + '☆'.repeat(5 - roundedRating)
 })
 const filteredProducts = computed(() => products.value)
+const filteredInventoryProducts = computed(() => {
+  const term = inventorySearch.value.trim().toLocaleLowerCase()
+  return inventoryProducts.value.filter((product) => {
+    const matchesSearch = !term || product.name.toLocaleLowerCase().includes(term) || product.sku.toLocaleLowerCase().includes(term)
+    const matchesFilter = inventoryFilter.value === 'all'
+      || (inventoryFilter.value === 'active' && product.is_active)
+      || (inventoryFilter.value === 'inactive' && !product.is_active)
+      || (inventoryFilter.value === 'low' && product.stock > 0 && product.stock <= 3)
+      || (inventoryFilter.value === 'out' && product.stock === 0)
+    return matchesSearch && matchesFilter
+  })
+})
 const isAdmin = computed(() => user.value?.role === 'admin')
 const isMerchant = computed(() => user.value?.role === 'merchant')
 const canManageShop = computed(() => isAdmin.value || isMerchant.value)
-const filteredAdminOrders = computed(() =>
-  orderFilter.value === 'all'
-    ? adminOrders.value
-    : adminOrders.value.filter((order) => order.status === orderFilter.value),
-)
+const filteredAdminOrders = computed(() => adminOrders.value)
 
 function shipmentForm(orderId: number) {
   shipmentForms.value[orderId] ??= { shipping_carrier: '', tracking_number: '' }
@@ -129,12 +182,18 @@ function orderStatusLabel(status: string) {
     shipped: '运输中',
     delivered: '已送达',
     cancelled: '已取消',
+    expired: '已超时',
   }
   return labels[status] ?? status
 }
 
 function money(value: string | number) {
   return new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'CNY' }).format(Number(value))
+}
+
+function formatUtcDateTime(value: string) {
+  const isoValue = /(?:Z|[+-]\d{2}:\d{2})$/i.test(value) ? value : `${value}Z`
+  return new Date(isoValue).toLocaleString('zh-CN')
 }
 
 function notify(message: string) {
@@ -181,8 +240,17 @@ async function loadCart() {
   cart.value = await api<Cart>('/cart', { token: token.value })
 }
 
-async function loadOrders() {
-  orders.value = await api<Order[]>('/orders', { token: token.value })
+async function loadOrders(announceStatusChanges = true) {
+  const updatedOrders = await api<Order[]>('/orders', { token: token.value })
+  const previousStatuses = new Map(orders.value.map((order) => [order.id, order.status]))
+  const changedOrders = updatedOrders.filter((order) => {
+    const previousStatus = previousStatuses.get(order.id)
+    return previousStatus !== undefined && previousStatus !== order.status
+  })
+  orders.value = updatedOrders
+  if (announceStatusChanges && changedOrders.length) {
+    notify(`${changedOrders.length} 笔订单状态有更新，请查看订单列表`)
+  }
 }
 
 async function loadFavorites(reset = true) {
@@ -342,24 +410,74 @@ async function loadMerchantStore() {
   }
 }
 
-async function loadAdminOrders() {
+async function loadAdminOrders(reset = true) {
   if (isAdmin.value) {
-    adminOrders.value = await api<AdminOrder[]>('/admin/orders?limit=100', { token: token.value })
+    if (reset) adminOrderOffset.value = 0
+    const params = new URLSearchParams({
+      limit: String(adminOrderLimit),
+      offset: String(adminOrderOffset.value),
+    })
+    if (orderFilter.value !== 'all') params.set('status', orderFilter.value)
+    if (adminOrderSearch.value.trim()) params.set('search', adminOrderSearch.value.trim())
+    const page = await api<AdminOrderPage>(`/admin/orders?${params}`, { token: token.value })
+    adminOrders.value = page.items
+    adminOrderTotal.value = page.total
   }
 }
 
-async function loadMerchantOrders() {
-  if (isMerchant.value) merchantOrders.value = await api<MerchantOrder[]>('/merchant/orders?limit=100', { token: token.value })
+async function changeAdminOrderPage(direction: -1 | 1) {
+  const nextOffset = adminOrderOffset.value + direction * adminOrderLimit
+  if (nextOffset < 0 || nextOffset >= adminOrderTotal.value) return
+  adminOrderOffset.value = nextOffset
+  await loadAdminOrders()
+}
+
+async function loadMerchantOrders(announceStatusChanges = true) {
+  if (!isMerchant.value) return
+  const updatedOrders = await api<MerchantOrder[]>('/merchant/orders?limit=100', { token: token.value })
+  const previousStatuses = new Map(merchantOrders.value.map((order) => [order.fulfillment_id, order.status]))
+  const changedOrders = updatedOrders.filter((order) => {
+    const previousStatus = previousStatuses.get(order.fulfillment_id)
+    return previousStatus !== undefined && previousStatus !== order.status
+  })
+  merchantOrders.value = updatedOrders
+  if (announceStatusChanges && changedOrders.length) {
+    notify(`${changedOrders.length} 笔店铺订单状态有更新，请查看店铺订单`)
+  }
 }
 
 async function loadAdminModeration() {
   if (!isAdmin.value) return
-  const [merchants, reports] = await Promise.all([
+  const [merchants] = await Promise.all([
     api<AdminMerchant[]>('/admin/merchants', { token: token.value }),
-    api<AdminReviewReport[]>('/admin/review-reports?limit=100', { token: token.value }),
   ])
   adminMerchants.value = merchants
-  reviewReports.value = reports
+  await loadAdminReports()
+}
+
+async function loadAdminReports(reset = true) {
+  if (!isAdmin.value) return
+  if (reset) reviewReportOffset.value = 0
+  const params = new URLSearchParams({
+    limit: String(reviewReportLimit),
+    offset: String(reviewReportOffset.value),
+  })
+  if (reviewReportStatus.value !== 'all') params.set('status', reviewReportStatus.value)
+  let page = await api<AdminReviewReportPage>(`/admin/review-reports?${params}`, { token: token.value })
+  if (page.total > 0 && reviewReportOffset.value >= page.total) {
+    reviewReportOffset.value = Math.floor((page.total - 1) / reviewReportLimit) * reviewReportLimit
+    params.set('offset', String(reviewReportOffset.value))
+    page = await api<AdminReviewReportPage>(`/admin/review-reports?${params}`, { token: token.value })
+  }
+  reviewReports.value = page.items
+  reviewReportTotal.value = page.total
+}
+
+async function changeReviewReportPage(direction: -1 | 1) {
+  const nextOffset = reviewReportOffset.value + direction * reviewReportLimit
+  if (nextOffset < 0 || nextOffset >= reviewReportTotal.value) return
+  reviewReportOffset.value = nextOffset
+  await loadAdminReports(false)
 }
 
 function merchantShipmentForm(fulfillmentId: number) {
@@ -374,7 +492,7 @@ async function submitMerchantShipment(order: MerchantOrder) {
       token: token.value,
       body: merchantShipmentForm(order.fulfillment_id),
     })
-    await loadMerchantOrders()
+    await loadMerchantOrders(false)
     notify(`订单 #${order.order_id} 已发货`)
   } catch (reason) {
     showError(reason instanceof Error ? reason.message : '登记发货失败')
@@ -403,10 +521,29 @@ async function processReviewReport(report: AdminReviewReport, status: 'resolved'
       token: token.value,
       body: { status },
     })
-    reviewReports.value = reviewReports.value.map((item) => item.id === report.id ? updated : item)
+    if (reviewReportStatus.value === 'all') {
+      reviewReports.value = reviewReports.value.map((item) => item.id === report.id ? updated : item)
+    } else {
+      await loadAdminReports(false)
+    }
     notify(status === 'resolved' ? '已隐藏违规评论' : '举报已驳回')
   } catch (reason) {
     showError(reason instanceof Error ? reason.message : '举报处理失败')
+  }
+}
+
+async function exportAccountData() {
+  try {
+    const data = await api<Record<string, unknown>>('/account/export', { token: token.value })
+    const objectUrl = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }))
+    const link = document.createElement('a')
+    link.href = objectUrl
+    link.download = `shiji-account-data-${new Date().toISOString().slice(0, 10)}.json`
+    link.click()
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000)
+    notify('个人数据已导出为 JSON 文件')
+  } catch (reason) {
+    showError(reason instanceof Error ? reason.message : '个人数据导出失败')
   }
 }
 
@@ -421,12 +558,12 @@ async function loadMoreFavorites() {
 async function submitShipment(order: AdminOrder) {
   const shipment = shipmentForm(order.id)
   try {
-    const updated = await api<AdminOrder>(`/admin/orders/${order.id}/shipment`, {
+    await api<AdminOrder>(`/admin/orders/${order.id}/shipment`, {
       method: 'POST',
       token: token.value,
       body: shipment,
     })
-    adminOrders.value = adminOrders.value.map((item) => (item.id === order.id ? updated : item))
+    await loadAdminOrders()
     notify(`订单 #${order.id} 已登记发货`)
   } catch (reason) {
     showError(reason instanceof Error ? reason.message : '物流信息登记失败')
@@ -435,11 +572,11 @@ async function submitShipment(order: AdminOrder) {
 
 async function confirmDelivery(order: AdminOrder) {
   try {
-    const updated = await api<AdminOrder>(`/admin/orders/${order.id}/delivery`, {
+    await api<AdminOrder>(`/admin/orders/${order.id}/delivery`, {
       method: 'POST',
       token: token.value,
     })
-    adminOrders.value = adminOrders.value.map((item) => (item.id === order.id ? updated : item))
+    await loadAdminOrders(false)
     notify(`订单 #${order.id} 已标记送达`)
   } catch (reason) {
     showError(reason instanceof Error ? reason.message : '订单状态更新失败')
@@ -448,6 +585,26 @@ async function confirmDelivery(order: AdminOrder) {
 
 function scrollToCollection() {
   document.getElementById('collection')?.scrollIntoView({ behavior: 'smooth' })
+}
+
+function showHeroSlide(index: number) {
+  heroSlideIndex.value = (index + heroSlides.length) % heroSlides.length
+}
+
+function nextHeroSlide() {
+  showHeroSlide(heroSlideIndex.value + 1)
+}
+
+function toggleHeroRotation() {
+  heroPaused.value = !heroPaused.value
+  startHeroRotation()
+}
+
+function startHeroRotation() {
+  window.clearInterval(heroRotationTimer)
+  if (currentView.value === 'shop' && !heroPaused.value && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    heroRotationTimer = window.setInterval(nextHeroSlide, 6000)
+  }
 }
 
 function openAuth(mode: 'login' | 'register' = 'login') {
@@ -494,7 +651,7 @@ async function submitAuth() {
     user.value = await api<User>('/auth/me', { token: token.value })
     authOpen.value = false
     authForm.value.password = ''
-    await Promise.all([loadCart(), loadFavorites()])
+    await Promise.all([loadCart(), loadFavorites(), loadOrders(false)])
     if (canManageShop.value) await Promise.all([loadInventory(), loadMerchantStore()])
     if (isAdmin.value) await Promise.all([loadCoupons(), loadAdminOrders(), loadAdminModeration()])
     if (isMerchant.value) await loadMerchantOrders()
@@ -510,7 +667,7 @@ async function restoreSession() {
   if (!token.value) return
   try {
     user.value = await api<User>('/auth/me', { token: token.value })
-    await Promise.all([loadCart(), loadFavorites()])
+    await Promise.all([loadCart(), loadFavorites(), loadOrders(false)])
     if (canManageShop.value) await Promise.all([loadInventory(), loadMerchantStore()])
     if (isAdmin.value) await Promise.all([loadCoupons(), loadAdminOrders(), loadAdminModeration()])
     if (isMerchant.value) await loadMerchantOrders()
@@ -558,6 +715,11 @@ async function saveProfile() {
 async function uploadAvatar(event: Event) {
   const file = (event.target as HTMLInputElement).files?.[0]
   if (!file) return
+  if (file.size > 5 * 1024 * 1024) {
+    showError('图片不能超过 5 MB')
+    ;(event.target as HTMLInputElement).value = ''
+    return
+  }
   const form = new FormData()
   form.append('image', file)
   try {
@@ -582,7 +744,8 @@ async function changePassword() {
       body: passwordForm.value,
     })
     passwordForm.value = { current_password: '', new_password: '' }
-    notify('密码已修改')
+    signOut()
+    notify('密码已修改，请使用新密码重新登录')
   } catch (reason) {
     showError(reason instanceof Error ? reason.message : '密码修改失败')
   }
@@ -605,7 +768,14 @@ async function deleteAccount() {
 }
 
 function selectProductImage(event: Event) {
-  const file = (event.target as HTMLInputElement).files?.[0] ?? null
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0] ?? null
+  if (file && file.size > 5 * 1024 * 1024) {
+    showError('图片不能超过 5 MB')
+    input.value = ''
+    productImage.value = null
+    return
+  }
   productImage.value = file
 }
 
@@ -678,7 +848,7 @@ async function checkout() {
     }
     cartOpen.value = false
     currentView.value = 'orders'
-    await loadOrders()
+    await loadOrders(false)
     notify(`订单 #${order.id} 已创建`)
   } catch (reason) {
     showError(reason instanceof Error ? reason.message : '结账失败，请检查库存和优惠码')
@@ -690,7 +860,7 @@ async function checkout() {
 async function cancelOrder(order: Order) {
   try {
     await api<Order>(`/orders/${order.id}/cancel`, { method: 'POST', token: token.value })
-    await Promise.all([loadOrders(), loadStore()])
+    await Promise.all([loadOrders(false), loadStore()])
     notify(`订单 #${order.id} 已取消，库存已释放`)
   } catch (reason) {
     showError(reason instanceof Error ? reason.message : '订单暂时无法取消')
@@ -701,7 +871,7 @@ async function startPayment(order: Order) {
   try {
     await api<Order>(`/orders/${order.id}/demo-payment`, { method: 'POST', token: token.value })
     paymentMessage.value = `订单 #${order.id} 已通过演示流程确认付款（没有真实收款）`
-    await loadOrders()
+    await loadOrders(false)
   } catch (reason) {
     showError(reason instanceof Error ? reason.message : '无法创建支付')
   }
@@ -713,7 +883,7 @@ async function confirmFulfillmentDelivery(order: Order, fulfillmentId: number) {
       method: 'POST',
       token: token.value,
     })
-    await loadOrders()
+    await loadOrders(false)
     notify(`订单 #${order.id} 的店铺商品已确认收货`)
   } catch (reason) {
     showError(reason instanceof Error ? reason.message : '确认收货失败')
@@ -900,14 +1070,32 @@ function categoryNameOf(id: number | null) {
   return categories.value.find((category) => category.id === id)?.name ?? '精选好物'
 }
 
+watch(currentView, startHeroRotation)
+
 onMounted(async () => {
+  startHeroRotation()
   await Promise.all([loadStore(), restoreSession()])
+})
+
+onUnmounted(() => {
+  window.clearInterval(heroRotationTimer)
 })
 
 let searchTimer = 0
 watch([activeCategory, search], () => {
   window.clearTimeout(searchTimer)
   searchTimer = window.setTimeout(() => void loadStore(), 250)
+})
+
+let adminOrderSearchTimer = 0
+watch([orderFilter, adminOrderSearch], () => {
+  if (!isAdmin.value || currentView.value !== 'admin') return
+  window.clearTimeout(adminOrderSearchTimer)
+  adminOrderSearchTimer = window.setTimeout(() => void loadAdminOrders(), 250)
+})
+
+watch(reviewReportStatus, () => {
+  if (isAdmin.value && currentView.value === 'admin') void loadAdminReports()
 })
 </script>
 
@@ -956,28 +1144,46 @@ watch([activeCategory, search], () => {
 
     <main>
       <section v-if="currentView === 'shop'" class="storefront">
-        <section class="hero">
+        <section class="hero" role="region" aria-label="首页主题封面" aria-roledescription="轮播">
           <div class="hero-copy">
-            <div class="eyebrow"><span class="eyebrow-line"></span> SLOW LIVING, WELL MADE</div>
-            <h1>把日常过成<br /><em>喜欢的样子。</em></h1>
-            <p>从一杯好茶到一盏暖灯，<br />每一件，都值得被认真挑选。</p>
+            <div class="eyebrow"><span class="eyebrow-line"></span> {{ currentHeroSlide.eyebrow }}</div>
+            <h1>{{ currentHeroSlide.title }}<br /><em>{{ currentHeroSlide.accent }}</em></h1>
+            <p>{{ currentHeroSlide.description }}</p>
             <button class="button button-dark hero-cta" @click="scrollToCollection">
               探索精选 <span>↗</span>
             </button>
-            <div class="hero-footnote"><span>01 — 06</span><span class="hero-dash"></span> THE EVERYDAY EDIT</div>
+            <div class="hero-footnote"><span>{{ String(heroSlideIndex + 1).padStart(2, '0') }} — {{ String(heroSlides.length).padStart(2, '0') }}</span><span class="hero-dash"></span> {{ currentHeroSlide.note }}</div>
           </div>
-          <div class="hero-art" aria-label="自然色调的家居器物插画">
-            <div class="art-sun"></div>
-            <div class="art-window"><span></span><i></i></div>
-            <div class="art-shelf"></div>
-            <div class="art-vase"><span></span></div>
-            <div class="art-book book-one"></div>
-            <div class="art-book book-two"></div>
-            <div class="art-plant"><i></i><i></i><i></i><b></b></div>
-            <div class="art-note">OBJECTS WITH<br />A LITTLE SOUL</div>
-            <span class="art-stamp">好物 · 慢选</span>
+          <Transition name="hero-scene" mode="out-in">
+            <div :key="currentHeroSlide.scene" class="hero-art" :class="`scene-${currentHeroSlide.scene}`" role="img" :aria-label="`${currentHeroSlide.stamp}主题插画`">
+              <div class="art-sun"></div>
+              <div class="art-window"><span></span><i></i></div>
+              <div class="art-shelf"></div>
+              <div class="art-vase"><span></span></div>
+              <div class="art-book book-one"></div>
+              <div class="art-book book-two"></div>
+              <div class="art-plant"><i></i><i></i><i></i><b></b></div>
+              <div class="art-note">{{ currentHeroSlide.note }}</div>
+              <span class="art-stamp">{{ currentHeroSlide.stamp }}</span>
+            </div>
+          </Transition>
+          <div class="hero-index">精选生活 · 第 {{ String(heroSlideIndex + 1).padStart(2, '0') }} 期</div>
+          <div class="hero-controls" aria-label="封面轮播控制">
+            <button type="button" aria-label="上一张封面" @click="showHeroSlide(heroSlideIndex - 1)">‹</button>
+            <div class="hero-dots" role="group" aria-label="选择封面">
+              <button
+                v-for="(_, index) in heroSlides"
+                :key="index"
+                type="button"
+                :aria-label="`第 ${index + 1} 张封面`"
+                :aria-current="heroSlideIndex === index ? 'true' : undefined"
+                :class="{ active: heroSlideIndex === index }"
+                @click="showHeroSlide(index)"
+              ></button>
+            </div>
+            <button type="button" aria-label="下一张封面" @click="nextHeroSlide">›</button>
+            <button type="button" :aria-label="heroPaused ? '继续自动轮播' : '暂停自动轮播'" @click="toggleHeroRotation">{{ heroPaused ? '▶' : 'Ⅱ' }}</button>
           </div>
-          <div class="hero-index">精选生活 · 第 01 期</div>
         </section>
 
         <section class="value-strip" aria-label="店铺服务">
@@ -1100,6 +1306,7 @@ watch([activeCategory, search], () => {
         <div v-else class="order-list">
           <article v-for="order in orders" :key="order.id" class="order-card">
             <div class="order-top"><div><span class="order-label">ORDER</span><strong>#{{ order.id.toString().padStart(5, '0') }}</strong></div><span class="order-status" :class="`status-${order.status}`">{{ orderStatusLabel(order.status) }}</span></div>
+            <p v-if="order.status === 'pending_payment' && order.expires_at" class="order-expiration">请在 {{ formatUtcDateTime(order.expires_at) }} 前完成演示付款，超时后会自动取消并释放库存。</p>
             <div class="order-items"><div v-for="item in order.items" :key="item.product_id" class="order-line"><span>{{ item.product_name }} <small>× {{ item.quantity }}</small></span><span>{{ money(Number(item.unit_price) * item.quantity) }}</span></div></div>
             <div v-if="order.recipient_name" class="order-shipping"><b>收货信息</b><span>{{ order.recipient_name }} · {{ order.recipient_phone }}</span><span>{{ order.shipping_region }} {{ order.shipping_address }}<template v-if="order.postal_code"> · {{ order.postal_code }}</template></span></div>
             <div v-if="order.shipping_carrier && order.tracking_number" class="order-tracking"><b>物流信息</b><span>{{ order.shipping_carrier }} · 运单号 {{ order.tracking_number }}</span><small v-if="order.shipped_at">发货时间：{{ new Date(order.shipped_at).toLocaleString('zh-CN') }}</small><small v-if="order.delivered_at">签收时间：{{ new Date(order.delivered_at).toLocaleString('zh-CN') }}</small></div>
@@ -1164,11 +1371,22 @@ watch([activeCategory, search], () => {
         </div>
 
         <div class="inventory-section">
-          <div class="inventory-heading"><div><span class="eyebrow">04 / CURRENT SELECTION</span><h2>商品库存</h2></div><span>{{ inventoryProducts.length }} ITEMS</span></div>
+          <div class="inventory-heading"><div><span class="eyebrow">04 / CURRENT SELECTION</span><h2>商品库存</h2></div><span>{{ filteredInventoryProducts.length }} / {{ inventoryProducts.length }} ITEMS</span></div>
+          <div class="inventory-filters">
+            <input v-model="inventorySearch" type="search" aria-label="搜索商品名称或 SKU" placeholder="搜索商品名称或 SKU" />
+            <select v-model="inventoryFilter" aria-label="筛选商品库存和上架状态">
+              <option value="all">全部商品</option>
+              <option value="active">仅在售</option>
+              <option value="inactive">仅已下架</option>
+              <option value="low">库存偏低（1–3 件）</option>
+              <option value="out">已售罄</option>
+            </select>
+          </div>
           <div v-if="!inventoryProducts.length" class="inventory-empty">还没有商品。上架第一件好物吧。</div>
+          <div v-else-if="!filteredInventoryProducts.length" class="inventory-empty">没有符合条件的商品，请调整搜索或筛选条件。</div>
           <div v-else class="inventory-table">
             <div class="inventory-row inventory-labels"><span>商品</span><span>分类</span><span>价格</span><span>库存</span><span>状态</span><span>管理</span></div>
-            <div v-for="product in inventoryProducts" :key="product.id" class="inventory-row">
+            <div v-for="product in filteredInventoryProducts" :key="product.id" class="inventory-row">
               <span class="inventory-product"><img v-if="product.image_url" :src="product.image_url" :alt="product.name" /><i v-else>{{ product.name[0] }}</i><b>{{ product.name }}<small>{{ product.sku }}</small></b></span>
               <span>{{ categoryNameOf(product.category_id) }}</span><span>{{ money(product.price) }}</span><span>{{ product.stock }} 件</span>
               <span><i class="live-dot" :class="{ offline: !product.is_active }"></i>{{ product.is_active ? '在售' : '已下架' }}</span>
@@ -1217,7 +1435,24 @@ watch([activeCategory, search], () => {
             </div>
           </div>
           <div v-if="isAdmin" class="admin-orders">
-            <div class="inventory-heading"><div><span class="eyebrow">07 / REVIEW MODERATION</span><h2>评论举报审核</h2></div></div>
+            <div class="inventory-heading">
+              <div><span class="eyebrow">07 / REVIEW MODERATION</span><h2>评论举报审核</h2></div>
+              <label class="admin-filter-control">处理状态
+                <select v-model="reviewReportStatus" aria-label="筛选举报处理状态">
+                  <option value="open">待审核</option>
+                  <option value="resolved">已隐藏</option>
+                  <option value="dismissed">已驳回</option>
+                  <option value="all">全部状态</option>
+                </select>
+              </label>
+            </div>
+            <div class="admin-order-search">
+              <span>共 {{ reviewReportTotal }} 条 · 当前第 {{ reviewReportTotal ? Math.floor(reviewReportOffset / reviewReportLimit) + 1 : 0 }} / {{ Math.ceil(reviewReportTotal / reviewReportLimit) }} 页</span>
+              <div class="admin-pagination">
+                <button class="text-button" :disabled="reviewReportOffset === 0" @click="changeReviewReportPage(-1)">上一页</button>
+                <button class="text-button" :disabled="reviewReportOffset + reviewReportLimit >= reviewReportTotal" @click="changeReviewReportPage(1)">下一页</button>
+              </div>
+            </div>
             <div v-if="!reviewReports.length" class="inventory-empty">暂无评论举报。</div>
             <div v-else class="admin-order-list">
               <article v-for="report in reviewReports" :key="report.id" class="admin-order-card">
@@ -1233,7 +1468,7 @@ watch([activeCategory, search], () => {
           </div>
           <div v-if="isAdmin" class="admin-orders">
             <div class="inventory-heading">
-              <div><span class="eyebrow">06 / CUSTOMER ORDERS</span><h2>顾客订单</h2></div>
+              <div><span class="eyebrow">08 / CUSTOMER ORDERS</span><h2>顾客订单</h2></div>
               <div class="order-filters" aria-label="筛选订单">
                 <button :class="{ active: orderFilter === 'all' }" @click="orderFilter = 'all'">全部</button>
                 <button :class="{ active: orderFilter === 'pending_payment' }" @click="orderFilter = 'pending_payment'">待付款</button>
@@ -1242,7 +1477,12 @@ watch([activeCategory, search], () => {
                 <button :class="{ active: orderFilter === 'shipped' }" @click="orderFilter = 'shipped'">运输中</button>
                 <button :class="{ active: orderFilter === 'delivered' }" @click="orderFilter = 'delivered'">已送达</button>
                 <button :class="{ active: orderFilter === 'cancelled' }" @click="orderFilter = 'cancelled'">已取消</button>
+                <button :class="{ active: orderFilter === 'expired' }" @click="orderFilter = 'expired'">已超时</button>
               </div>
+            </div>
+            <div class="admin-order-search">
+              <input v-model="adminOrderSearch" type="search" maxlength="120" placeholder="搜索订单编号或顾客邮箱" aria-label="搜索订单编号或顾客邮箱" />
+              <span>共 {{ adminOrderTotal }} 笔</span>
             </div>
             <div v-if="!filteredAdminOrders.length" class="inventory-empty">这个分类下暂时没有订单。</div>
             <div v-else class="admin-order-list">
@@ -1272,7 +1512,11 @@ watch([activeCategory, search], () => {
                 <div v-if="order.coupon_code" class="admin-order-coupon">优惠码 {{ order.coupon_code }} · 优惠 {{ money(order.discount) }}</div>
               </article>
             </div>
-            <p v-if="adminOrders.length >= 100" class="admin-order-limit">仅展示最近 100 笔订单。</p>
+            <div v-if="adminOrderTotal > adminOrderLimit" class="pagination-actions admin-order-pagination">
+              <button class="button button-outline" :disabled="adminOrderOffset === 0" @click="changeAdminOrderPage(-1)">上一页</button>
+              <span>第 {{ Math.floor(adminOrderOffset / adminOrderLimit) + 1 }} / {{ Math.ceil(adminOrderTotal / adminOrderLimit) }} 页</span>
+              <button class="button button-outline" :disabled="adminOrderOffset + adminOrderLimit >= adminOrderTotal" @click="changeAdminOrderPage(1)">下一页</button>
+            </div>
             <p class="admin-order-note">管理员可以协助处理整笔订单；商家仅能管理自己店铺的商品履约。演示支付不会收款，物流状态由人工维护。</p>
           </div>
         </div>
@@ -1414,6 +1658,8 @@ watch([activeCategory, search], () => {
           <button class="close-button auth-close" aria-label="关闭账户管理" @click="accountOpen = false">×</button>
           <div class="auth-mark">拾</div><div class="eyebrow"><span class="eyebrow-line"></span> ACCOUNT SETTINGS</div>
           <h2>账户管理。</h2><p>{{ user.email }} · {{ user.role === 'merchant' ? '商家' : user.role === 'admin' ? '管理员' : '顾客' }}</p>
+          <button class="button button-outline auth-submit" type="button" @click="exportAccountData">导出我的个人数据 JSON</button>
+          <p class="account-data-note">文件可能包含账户资料、订单地址{{ isMerchant ? '及本店履约订单的顾客信息' : '' }}，请妥善保管。</p>
           <label>头像<input type="file" accept="image/jpeg,image/png,image/webp" @change="uploadAvatar" /></label>
           <div v-if="user.avatar_url" class="account-avatar-preview"><img :src="user.avatar_url" alt="当前头像" /></div>
           <form @submit.prevent="saveProfile">

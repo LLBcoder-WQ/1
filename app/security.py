@@ -34,10 +34,10 @@ def verify_password(password: str, encoded: str) -> bool:
         return False
 
 
-def create_access_token(user_id: int, role: str) -> str:
+def create_access_token(user_id: int, role: str, token_version: int = 0) -> str:
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=get_settings().access_token_minutes)
     return jwt.encode(
-        {"sub": str(user_id), "role": role, "exp": expires_at},
+        {"sub": str(user_id), "role": role, "ver": token_version, "exp": expires_at},
         get_settings().secret_key,
         algorithm="HS256",
     )

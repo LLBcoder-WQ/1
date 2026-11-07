@@ -1,9 +1,11 @@
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from fastapi.testclient import TestClient
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, inspect, select, text
 
 from app.config import Settings
 from app.database import (
@@ -14,8 +16,10 @@ from app.database import (
     get_db,
 )
 from app.main import CORS_ALLOWED_METHODS, app
-from app.models import Order, User
-from app.security import hash_password
+from app.models import Coupon, MerchantFulfillment, Order, OrderItem, Payment, Product, User
+from app.order_expiration import expire_pending_orders
+from app.security import hash_password, verify_password
+from app.reset_password import reset_existing_account_password
 from app.storage import MAX_IMAGE_SIZE, upload_public_image
 
 
@@ -94,6 +98,86 @@ def test_favorite_put_is_allowed_by_cross_origin_preflight():
     assert "PUT" in response.headers["access-control-allow-methods"]
 
 
+def test_health_check_includes_database_readiness(client: TestClient):
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "database": "ok"}
+
+
+def test_login_is_throttled_after_repeated_failures(client: TestClient):
+    payload = {"email": "buyer@example.com", "password": "incorrect-password"}
+    for _ in range(5):
+        assert client.post("/api/auth/login", json=payload).status_code == 401
+    throttled = client.post("/api/auth/login", json={**payload, "password": "buyer-password"})
+    assert throttled.status_code == 429
+    assert int(throttled.headers["Retry-After"]) > 0
+
+
+def test_successful_login_clears_recent_failed_attempts(client: TestClient):
+    payload = {"email": "buyer@example.com", "password": "incorrect-password"}
+    for _ in range(4):
+        assert client.post("/api/auth/login", json=payload).status_code == 401
+    assert client.post(
+        "/api/auth/login",
+        json={"email": "buyer@example.com", "password": "buyer-password"},
+    ).status_code == 200
+    assert client.post("/api/auth/login", json=payload).status_code == 401
+
+
+def test_registration_attempts_are_throttled_per_email(client: TestClient):
+    payload = {"email": "limited@example.com", "password": "valid-password"}
+    assert client.post("/api/auth/register", json=payload).status_code == 201
+    for _ in range(4):
+        assert client.post("/api/auth/register", json=payload).status_code == 409
+    assert client.post("/api/auth/register", json=payload).status_code == 429
+
+
+def test_account_data_export_contains_only_authenticated_users_data(client: TestClient):
+    admin = auth(client, "admin@example.com", "admin-password")
+    buyer = auth(client, "buyer@example.com", "buyer-password")
+    product = client.post(
+        "/api/products",
+        json={"sku": "EXPORT-1", "name": "Export item", "price": "12.00", "stock": 2},
+        headers=admin,
+    ).json()
+    client.post("/api/cart/items", json={"product_id": product["id"], "quantity": 1}, headers=buyer)
+    order = client.post("/api/orders", json=delivery_details(), headers=buyer).json()
+
+    exported = client.get("/api/account/export", headers=buyer)
+    assert exported.status_code == 200
+    data = exported.json()
+    assert data["format"] == "shiji-account-export-v1"
+    assert data["account"]["email"] == "buyer@example.com"
+    assert data["orders"][0]["id"] == order["id"]
+    assert data["orders"][0]["shipping_address"] == delivery_details()["shipping_address"]
+    assert data["orders"][0]["items"][0]["product_name"] == "Export item"
+    assert "buyer@example.com" not in str(client.get("/api/account/export", headers=admin).json()["orders"])
+
+
+def test_admin_password_reset_preserves_role_and_invalidates_old_tokens():
+    test_engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=test_engine)
+    TestingSession = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
+    with TestingSession() as db:
+        user = User(email="merchant@example.com", password_hash=hash_password("old-password"), role="merchant")
+        db.add(user)
+        db.commit()
+        original_token_version = user.token_version
+
+        assert reset_existing_account_password(db, user.email, "new-password")
+        db.refresh(user)
+        assert user.role == "merchant"
+        assert user.token_version == original_token_version + 1
+        assert verify_password("new-password", user.password_hash)
+        assert not reset_existing_account_password(db, "missing@example.com", "new-password")
+    Base.metadata.drop_all(bind=test_engine)
+    test_engine.dispose()
+
+
 def test_checkout_applies_coupon_deducts_stock_and_clears_cart(client: TestClient):
     admin = auth(client, "admin@example.com", "admin-password")
     buyer = auth(client, "buyer@example.com", "buyer-password")
@@ -139,15 +223,16 @@ def test_checkout_applies_coupon_deducts_stock_and_clears_cart(client: TestClien
     assert order.json()["shipping_address"] == "文三路 100 号 2 幢 301 室"
     assert order.json()["postal_code"] == "310012"
     admin_orders = client.get("/api/admin/orders", headers=admin)
-    assert admin_orders.json()[0]["recipient_phone"] == "+86 138 0000 0000"
-    assert admin_orders.json()[0]["shipping_address"] == "文三路 100 号 2 幢 301 室"
+    assert admin_orders.json()["items"][0]["recipient_phone"] == "+86 138 0000 0000"
+    assert admin_orders.json()["items"][0]["shipping_address"] == "文三路 100 号 2 幢 301 室"
     assert client.get("/api/products/1").json()["stock"] == 2
     assert client.get("/api/cart", headers=buyer).json()["items"] == []
     admin_orders = client.get("/api/admin/orders", headers=admin)
     assert admin_orders.status_code == 200
-    assert len(admin_orders.json()) == 1
-    assert admin_orders.json()[0]["customer_email"] == "buyer@example.com"
-    assert admin_orders.json()[0]["items"][0]["product_name"] == "Example book"
+    assert admin_orders.json()["total"] == 1
+    assert len(admin_orders.json()["items"]) == 1
+    assert admin_orders.json()["items"][0]["customer_email"] == "buyer@example.com"
+    assert admin_orders.json()["items"][0]["items"][0]["product_name"] == "Example book"
     assert client.get("/api/admin/orders?limit=101", headers=admin).status_code == 422
     other_user = client.post(
         "/api/auth/register",
@@ -169,6 +254,161 @@ def test_checkout_rejects_invalid_recipient_phone(client: TestClient):
         headers=buyer,
     )
     assert response.status_code == 422
+
+
+def test_admin_orders_are_filterable_and_paginated(client: TestClient):
+    admin = auth(client, "admin@example.com", "admin-password")
+    buyer = auth(client, "buyer@example.com", "buyer-password")
+    order_ids = []
+    for index in range(2):
+        product = client.post(
+            "/api/products",
+            json={"sku": f"ADMIN-PAGE-{index}", "name": f"Paged order {index}", "price": "3.00", "stock": 1},
+            headers=admin,
+        ).json()
+        client.post(
+            "/api/cart/items",
+            json={"product_id": product["id"], "quantity": 1},
+            headers=buyer,
+        )
+        order = client.post("/api/orders", json=delivery_details(), headers=buyer).json()
+        order_ids.append(order["id"])
+    assert client.post(f"/api/orders/{order_ids[1]}/cancel", headers=buyer).status_code == 200
+
+    page = client.get("/api/admin/orders?limit=1&offset=0", headers=admin).json()
+    assert page["total"] == 2
+    assert len(page["items"]) == 1
+    assert page["offset"] == 0
+    assert client.get(
+        "/api/admin/orders?status=cancelled",
+        headers=admin,
+    ).json()["items"][0]["id"] == order_ids[1]
+    assert client.get(
+        "/api/admin/orders?status=not-a-status",
+        headers=admin,
+    ).status_code == 422
+    assert client.get(
+        "/api/admin/orders?search=buyer%40example.com",
+        headers=admin,
+    ).json()["total"] == 2
+    search_result = client.get(
+        f"/api/admin/orders?search={order_ids[0]}",
+        headers=admin,
+    ).json()
+    assert search_result["total"] == 1
+    assert search_result["items"][0]["id"] == order_ids[0]
+
+
+def test_unpaid_order_expiry_restores_stock_and_coupon_once():
+    test_engine = create_engine("sqlite://")
+    TestingSession = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
+    Base.metadata.create_all(bind=test_engine)
+    try:
+        now = datetime.now(timezone.utc)
+        with TestingSession() as db:
+            buyer = User(email="expiry@example.com", password_hash=hash_password("test-password"))
+            product = Product(
+                sku="EXPIRY-1",
+                name="Expiring item",
+                price="10.00",
+                stock=0,
+            )
+            coupon = Coupon(
+                code="EXPIRY10",
+                discount_type="fixed",
+                value="1.00",
+                uses_count=1,
+            )
+            db.add_all([buyer, product, coupon])
+            db.flush()
+            order = Order(
+                user_id=buyer.id,
+                status="pending_payment",
+                subtotal="10.00",
+                discount="1.00",
+                total="9.00",
+                coupon_code="EXPIRY10",
+                created_at=now - timedelta(hours=1),
+                expires_at=now - timedelta(minutes=1),
+                items=[],
+                fulfillments=[],
+            )
+            db.add(order)
+            db.flush()
+            db.add(
+                OrderItem(
+                    order_id=order.id,
+                    product_id=product.id,
+                    product_name="Expiring item",
+                    unit_price="10.00",
+                    quantity=2,
+                )
+            )
+            fulfillment = MerchantFulfillment(
+                order_id=order.id,
+                seller_id=None,
+                status="pending_payment",
+            )
+            payment = Payment(
+                order_id=order.id,
+                provider="demo",
+                provider_reference="expiry-payment",
+                status="pending",
+            )
+            db.add_all([fulfillment, payment])
+            legacy_order = Order(
+                user_id=buyer.id,
+                status="pending_payment",
+                subtotal="10.00",
+                discount="0.00",
+                total="10.00",
+                created_at=now - timedelta(minutes=31),
+                expires_at=None,
+                items=[],
+                fulfillments=[],
+            )
+            db.add(legacy_order)
+            db.flush()
+            db.add(
+                OrderItem(
+                    order_id=legacy_order.id,
+                    product_id=product.id,
+                    product_name="Legacy expiring item",
+                    unit_price="10.00",
+                    quantity=3,
+                )
+            )
+            legacy_fulfillment = MerchantFulfillment(
+                order_id=legacy_order.id,
+                seller_id=None,
+                status="pending_payment",
+            )
+            legacy_payment = Payment(
+                order_id=legacy_order.id,
+                provider="demo",
+                provider_reference="legacy-expiry-payment",
+                status="pending",
+            )
+            db.add_all([legacy_fulfillment, legacy_payment])
+            db.commit()
+            order_id = order.id
+            legacy_order_id = legacy_order.id
+
+            assert expire_pending_orders(db, now=now) == 2
+            db.expire_all()
+            assert db.get(Order, order_id).status == "expired"
+            assert db.get(Order, legacy_order_id).status == "expired"
+            assert db.get(Product, product.id).stock == 5
+            assert db.get(Coupon, coupon.id).uses_count == 0
+            assert db.scalar(select(Payment.status).where(Payment.order_id == order_id)) == "cancelled"
+            assert db.scalar(
+                select(MerchantFulfillment.status).where(MerchantFulfillment.order_id == order_id)
+            ) == "expired"
+            assert expire_pending_orders(db, now=now) == 0
+            assert db.get(Product, product.id).stock == 5
+    finally:
+        Base.metadata.drop_all(bind=test_engine)
+        test_engine.dispose()
 
 
 def test_customer_cannot_manage_products_and_order_is_private(client: TestClient):
@@ -322,12 +562,15 @@ def test_legacy_account_columns_are_added_idempotently():
         with legacy_engine.begin() as connection:
             connection.execute(text("CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR(255))"))
             connection.execute(text("CREATE TABLE products (id INTEGER PRIMARY KEY, sku VARCHAR(64))"))
+            connection.execute(text("CREATE TABLE orders (id INTEGER PRIMARY KEY)"))
         ensure_account_columns(legacy_engine)
         ensure_account_columns(legacy_engine)
         user_columns = {column["name"] for column in inspect(legacy_engine).get_columns("users")}
         product_columns = {column["name"] for column in inspect(legacy_engine).get_columns("products")}
         assert {"display_name", "avatar_url", "is_suspended"}.issubset(user_columns)
+        assert "token_version" in user_columns
         assert {"image_url", "seller_id"}.issubset(product_columns)
+        assert "expires_at" in {column["name"] for column in inspect(legacy_engine).get_columns("orders")}
     finally:
         legacy_engine.dispose()
 
@@ -567,14 +810,16 @@ def test_account_password_change_and_deletion_preserve_orders(client: TestClient
     assert client.post(
         "/api/auth/login", json={"email": "buyer@example.com", "password": "buyer-password"}
     ).status_code == 401
+    assert client.get("/api/auth/me", headers=buyer).status_code == 401
+    buyer = auth(client, "buyer@example.com", "new-buyer-password")
     assert client.request(
         "DELETE", "/api/account", json={"password": "new-buyer-password"}, headers=buyer
     ).status_code == 204
     assert client.get("/api/auth/me", headers=buyer).status_code == 401
     admin_orders = client.get("/api/admin/orders", headers=admin)
     assert admin_orders.status_code == 200
-    assert admin_orders.json()[0]["id"] == order["id"]
-    assert admin_orders.json()[0]["customer_email"].endswith("@deleted.invalid")
+    assert admin_orders.json()["items"][0]["id"] == order["id"]
+    assert admin_orders.json()["items"][0]["customer_email"].endswith("@deleted.invalid")
 
 
 def test_merchant_account_deletion_unlists_products(client: TestClient):
@@ -610,14 +855,23 @@ def test_image_upload_uses_storage_and_rejects_non_owner(client: TestClient, mon
         json={"sku": "IMAGE-1", "name": "Sample", "price": "5.00", "stock": 1},
         headers=owner,
     ).json()
-    monkeypatch.setattr(
-        "app.main.upload_public_image",
-        lambda content, content_type, prefix: f"https://storage.example/{prefix}/image.png",
+    upload_urls = iter(
+        [
+            f"https://storage.example/products/{product['id']}/old.png",
+            f"https://storage.example/products/{product['id']}/new.png",
+        ]
     )
+    monkeypatch.setattr("app.main.upload_public_image", lambda content, content_type, prefix: next(upload_urls))
+    deleted_images: list[str] = []
+    monkeypatch.setattr("app.main.delete_public_image", deleted_images.append)
     image = ("image.png", b"\x89PNG\r\n\x1a\nimage", "image/png")
     uploaded = client.post(f"/api/products/{product['id']}/image", files={"image": image}, headers=owner)
     assert uploaded.status_code == 200
     assert "/products/" in uploaded.json()["image_url"]
+    replaced = client.post(f"/api/products/{product['id']}/image", files={"image": image}, headers=owner)
+    assert replaced.status_code == 200
+    assert replaced.json()["image_url"].endswith("new.png")
+    assert deleted_images == [f"https://storage.example/products/{product['id']}/old.png"]
     assert client.post(
         f"/api/products/{product['id']}/image", files={"image": image}, headers=other
     ).status_code == 403
@@ -632,17 +886,27 @@ def test_account_avatar_upload_updates_profile(client: TestClient, monkeypatch: 
     )
     assert profile.status_code == 200
     assert profile.json()["display_name"] == "Sample User"
-    monkeypatch.setattr(
-        "app.main.upload_public_image",
-        lambda content, content_type, prefix: f"https://storage.example/{prefix}/avatar.png",
+    upload_urls = iter(
+        ["https://storage.example/avatars/2/old.png", "https://storage.example/avatars/2/new.png"]
     )
+    monkeypatch.setattr("app.main.upload_public_image", lambda content, content_type, prefix: next(upload_urls))
+    deleted_images: list[str] = []
+    monkeypatch.setattr("app.main.delete_public_image", deleted_images.append)
     response = client.post(
         "/api/account/avatar",
         files={"image": ("avatar.png", b"\x89PNG\r\n\x1a\nimage", "image/png")},
         headers=buyer,
     )
     assert response.status_code == 200
-    assert response.json()["avatar_url"].endswith("/avatar.png")
+    assert response.json()["avatar_url"].endswith("/old.png")
+    replacement = client.post(
+        "/api/account/avatar",
+        files={"image": ("avatar.png", b"\x89PNG\r\n\x1a\nimage", "image/png")},
+        headers=buyer,
+    )
+    assert replacement.status_code == 200
+    assert replacement.json()["avatar_url"].endswith("/new.png")
+    assert deleted_images == ["https://storage.example/avatars/2/old.png"]
 
 
 def test_product_reviews_are_public_and_upsert_per_customer(client: TestClient):
@@ -826,7 +1090,10 @@ def test_review_report_moderation_and_merchant_suspension(client: TestClient):
     )
     assert report.status_code == 201
     reports = client.get("/api/admin/review-reports", headers=admin)
-    assert reports.json()[0]["status"] == "open"
+    assert reports.json()["total"] == 1
+    assert reports.json()["items"][0]["status"] == "open"
+    assert client.get("/api/admin/review-reports?status=resolved", headers=admin).json()["total"] == 0
+    assert client.get("/api/admin/review-reports?status=invalid", headers=admin).status_code == 422
     resolved = client.patch(
         f"/api/admin/review-reports/{report.json()['id']}",
         json={"status": "resolved"},

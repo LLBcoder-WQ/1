@@ -57,6 +57,7 @@ def ensure_account_columns(target_engine: Engine = engine) -> None:
             "display_name": "VARCHAR(100)",
             "avatar_url": "VARCHAR(1000)",
             "is_suspended": "BOOLEAN NOT NULL DEFAULT FALSE",
+            "token_version": "INTEGER NOT NULL DEFAULT 0",
         },
         "products": {
             "image_url": "VARCHAR(1000)",
@@ -72,6 +73,7 @@ def ensure_account_columns(target_engine: Engine = engine) -> None:
     with target_engine.begin() as connection:
         inspector = inspect(connection)
         tables = set(inspector.get_table_names())
+        order_item_seller_column_added = False
         for table_name, columns in additions.items():
             if table_name not in tables:
                 continue
@@ -81,7 +83,9 @@ def ensure_account_columns(target_engine: Engine = engine) -> None:
                     connection.execute(
                         text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
                     )
-        if "order_items" in inspect(connection).get_table_names():
+                    if table_name == "order_items" and column_name == "seller_id":
+                        order_item_seller_column_added = True
+        if order_item_seller_column_added and "products" in tables:
             connection.execute(
                 text(
                     "UPDATE order_items SET seller_id = "
@@ -89,6 +93,10 @@ def ensure_account_columns(target_engine: Engine = engine) -> None:
                     "WHERE seller_id IS NULL"
                 )
             )
+        if "orders" in inspect(connection).get_table_names():
+            existing = {column["name"] for column in inspect(connection).get_columns("orders")}
+            if "expires_at" not in existing:
+                connection.execute(text("ALTER TABLE orders ADD COLUMN expires_at TIMESTAMP"))
 
 
 def ensure_merchant_fulfillments(target_engine: Engine = engine) -> None:

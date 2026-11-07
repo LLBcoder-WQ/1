@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./shop.db"
     secret_key: str = _DEVELOPMENT_SECRET
     access_token_minutes: int = Field(default=60, gt=0, le=1440)
+    order_payment_expiry_minutes: int = Field(default=30, ge=5, le=1440)
     environment: Literal["development", "production"] = "development"
     cors_origins: str = ""
     supabase_url: str = ""

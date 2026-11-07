@@ -25,6 +25,8 @@ def main():
         else:
             user.password_hash = hash_password(password)
             user.role = "admin"
+            user.is_suspended = False
+            user.token_version += 1
         db.commit()
     print(f"Administrator account ready: {args.email.lower()}")
 

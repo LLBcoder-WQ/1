@@ -13,6 +13,8 @@ services:
         generateValue: true
       - key: SHOP_DATABASE_URL
         sync: false
+      - key: SHOP_ORDER_PAYMENT_EXPIRY_MINUTES
+        value: 30
       - key: SHOP_CORS_ORIGINS
         sync: false
       - key: SHOP_SUPABASE_URL

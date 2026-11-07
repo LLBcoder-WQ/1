@@ -1,17 +1,26 @@
+import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import String, cast, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.config import get_settings
+from app.auth_throttle import (
+    LOGIN_LIMIT,
+    LOGIN_WINDOW,
+    REGISTER_LIMIT,
+    REGISTER_WINDOW,
+    check_auth_limit,
+    record_auth_attempt,
+)
 from app.database import (
     Base,
     engine,
@@ -27,6 +36,7 @@ from app.dependencies import (
     require_shop_manager,
 )
 from app.models import (
+    AuthAttempt,
     CartItem,
     Category,
     Coupon,
@@ -56,7 +66,9 @@ from app.schemas import (
     AccountDelete,
     AdminMerchantRead,
     AdminMerchantStatus,
+    AdminOrderPageRead,
     AdminReviewReportRead,
+    AdminReviewReportPageRead,
     FavoriteStatus,
     LoginInput,
     PasswordChange,
@@ -81,8 +93,10 @@ from app.schemas import (
 )
 from app.security import create_access_token, hash_password, verify_password
 from app.storage import delete_public_image, upload_public_image
+from app.order_expiration import expire_pending_orders
 
 CORS_ALLOWED_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
+logger = logging.getLogger(__name__)
 
 Base.metadata.create_all(bind=engine)
 ensure_account_columns()
@@ -114,6 +128,7 @@ def money(value: Decimal) -> Decimal:
 
 
 def get_order_for_user(db: Session, order_id: int, user: User) -> Order:
+    expire_pending_orders(db)
     order = db.scalar(
         select(Order)
         .options(
@@ -153,6 +168,7 @@ def admin_order_data(order: Order, customer_email: str) -> dict:
         "discount": order.discount,
         "total": order.total,
         "coupon_code": order.coupon_code,
+        "expires_at": order.expires_at,
         "recipient_name": order.recipient_name,
         "recipient_phone": order.recipient_phone,
         "shipping_region": order.shipping_region,
@@ -188,13 +204,39 @@ def merchant_order_data(fulfillment: MerchantFulfillment, customer_email: str) -
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    with engine.connect() as connection:
+        connection.execute(select(1))
+    return {"status": "ok", "database": "ok"}
+
+
+@app.middleware("http")
+async def log_request_metrics(request: Request, call_next):
+    started_at = datetime.now(timezone.utc)
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        elapsed_ms = (datetime.now(timezone.utc) - started_at).total_seconds() * 1000
+        logger.info(
+            "http_request method=%s path=%s status=%s duration_ms=%.1f",
+            request.method,
+            request.url.path,
+            status_code,
+            elapsed_ms,
+        )
 
 
 @app.post("/api/auth/register", response_model=UserRead, status_code=status.HTTP_201_CREATED)
 def register(payload: UserCreate, db: DbSession):
+    email = str(payload.email).lower()
+    attempt_key = check_auth_limit(
+        db, "register", email, REGISTER_LIMIT, REGISTER_WINDOW
+    )
+    record_auth_attempt(db, attempt_key)
     user = User(
-        email=str(payload.email).lower(),
+        email=email,
         password_hash=hash_password(payload.password),
         role=payload.role,
     )
@@ -212,14 +254,19 @@ def register(payload: UserCreate, db: DbSession):
 
 @app.post("/api/auth/login", response_model=TokenRead)
 def login(payload: LoginInput, db: DbSession):
-    user = db.scalar(select(User).where(User.email == str(payload.email).lower()))
+    email = str(payload.email).lower()
+    attempt_key = check_auth_limit(db, "login", email, LOGIN_LIMIT, LOGIN_WINDOW)
+    user = db.scalar(select(User).where(User.email == email))
     if user is None or not verify_password(payload.password, user.password_hash):
+        record_auth_attempt(db, attempt_key)
         raise HTTPException(status_code=401, detail="Incorrect email or password")
     if user.role != "admin" and user.role != payload.role:
         raise HTTPException(status_code=403, detail="登录入口与账号身份不匹配")
     if user.is_suspended:
         raise HTTPException(status_code=403, detail="账号已暂停，请联系平台管理员")
-    return TokenRead(access_token=create_access_token(user.id, user.role))
+    db.execute(delete(AuthAttempt).where(AuthAttempt.key_hash == attempt_key))
+    db.commit()
+    return TokenRead(access_token=create_access_token(user.id, user.role, user.token_version))
 
 
 @app.get("/api/auth/me", response_model=UserRead)
@@ -236,6 +283,183 @@ def update_account_profile(payload: ProfileUpdate, db: DbSession, user: CurrentU
     return user
 
 
+@app.get("/api/account/export")
+def export_account_data(db: DbSession, user: CurrentUser):
+    orders = db.scalars(
+        select(Order)
+        .options(selectinload(Order.items))
+        .where(Order.user_id == user.id)
+        .order_by(Order.created_at.desc(), Order.id.desc())
+    ).all()
+    favorites = db.scalars(
+        select(ProductFavorite)
+        .options(selectinload(ProductFavorite.product))
+        .where(ProductFavorite.user_id == user.id)
+        .order_by(ProductFavorite.created_at.desc())
+    ).all()
+    reviews = db.scalars(
+        select(ProductReview)
+        .where(ProductReview.user_id == user.id)
+        .order_by(ProductReview.created_at.desc())
+    ).all()
+    reports = db.scalars(
+        select(ProductReviewReport)
+        .where(ProductReviewReport.reporter_id == user.id)
+        .order_by(ProductReviewReport.created_at.desc())
+    ).all()
+    cart_items = db.scalars(
+        select(CartItem)
+        .options(selectinload(CartItem.product))
+        .where(CartItem.user_id == user.id)
+        .order_by(CartItem.id)
+    ).all()
+    products = db.scalars(
+        select(Product)
+        .where(Product.seller_id == user.id)
+        .order_by(Product.id)
+    ).all() if user.role == "merchant" else []
+    merchant_fulfillments = db.scalars(
+        select(MerchantFulfillment)
+        .options(selectinload(MerchantFulfillment.order).selectinload(Order.items))
+        .where(MerchantFulfillment.seller_id == user.id)
+        .order_by(MerchantFulfillment.id)
+    ).all() if user.role == "merchant" else []
+    order_ids = [item.id for item in orders]
+    payments = db.scalars(
+        select(Payment).where(Payment.order_id.in_(order_ids)).order_by(Payment.created_at)
+    ).all() if order_ids else []
+
+    def as_iso(value: datetime | None) -> str | None:
+        return value.isoformat() if value is not None else None
+
+    return {
+        "format": "shiji-account-export-v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "account": {
+            "email": user.email,
+            "role": user.role,
+            "display_name": user.display_name,
+            "avatar_url": user.avatar_url,
+            "created_at": as_iso(user.created_at),
+        },
+        "store": (
+            {
+                "name": user.store.name,
+                "address": user.store.address,
+                "description": user.store.description,
+            }
+            if user.store is not None
+            else None
+        ),
+        "products": [
+            {
+                "id": item.id,
+                "sku": item.sku,
+                "name": item.name,
+                "description": item.description,
+                "price": str(item.price),
+                "stock": item.stock,
+                "is_active": item.is_active,
+                "image_url": item.image_url,
+            }
+            for item in products
+        ],
+        "cart": [
+            {"product_id": item.product_id, "product_name": item.product.name, "quantity": item.quantity}
+            for item in cart_items
+        ],
+        "favorites": [
+            {
+                "created_at": as_iso(item.created_at),
+                "product_id": item.product_id,
+                "product_name": item.product.name,
+            }
+            for item in favorites
+        ],
+        "reviews": [
+            {
+                "product_id": item.product_id,
+                "rating": item.rating,
+                "content": item.content,
+                "created_at": as_iso(item.created_at),
+                "updated_at": as_iso(item.updated_at),
+            }
+            for item in reviews
+        ],
+        "review_reports": [
+            {
+                "review_id": item.review_id,
+                "reason": item.reason,
+                "status": item.status,
+                "created_at": as_iso(item.created_at),
+            }
+            for item in reports
+        ],
+        "orders": [
+            {
+                "id": item.id,
+                "status": item.status,
+                "subtotal": str(item.subtotal),
+                "discount": str(item.discount),
+                "total": str(item.total),
+                "coupon_code": item.coupon_code,
+                "expires_at": as_iso(item.expires_at),
+                "recipient_name": item.recipient_name,
+                "recipient_phone": item.recipient_phone,
+                "shipping_region": item.shipping_region,
+                "shipping_address": item.shipping_address,
+                "postal_code": item.postal_code,
+                "shipping_carrier": item.shipping_carrier,
+                "tracking_number": item.tracking_number,
+                "shipped_at": as_iso(item.shipped_at),
+                "delivered_at": as_iso(item.delivered_at),
+                "created_at": as_iso(item.created_at),
+                "items": [
+                    {
+                        "product_name": line.product_name,
+                        "unit_price": str(line.unit_price),
+                        "quantity": line.quantity,
+                    }
+                    for line in item.items
+                ],
+            }
+            for item in orders
+        ],
+        "payments": [
+            {
+                "order_id": item.order_id,
+                "provider": item.provider,
+                "status": item.status,
+                "created_at": as_iso(item.created_at),
+            }
+            for item in payments
+        ],
+        "merchant_fulfillments": [
+            {
+                "order_id": fulfillment.order_id,
+                "status": fulfillment.status,
+                "shipping_carrier": fulfillment.shipping_carrier,
+                "tracking_number": fulfillment.tracking_number,
+                "shipped_at": as_iso(fulfillment.shipped_at),
+                "delivered_at": as_iso(fulfillment.delivered_at),
+                "recipient_name": fulfillment.order.recipient_name,
+                "recipient_phone": fulfillment.order.recipient_phone,
+                "shipping_region": fulfillment.order.shipping_region,
+                "shipping_address": fulfillment.order.shipping_address,
+                "items": [
+                    {
+                        "product_name": line.product_name,
+                        "unit_price": str(line.unit_price),
+                        "quantity": line.quantity,
+                    }
+                    for line in fulfillment.items
+                ],
+            }
+            for fulfillment in merchant_fulfillments
+        ],
+    }
+
+
 @app.post("/api/account/avatar", response_model=UserRead)
 def upload_account_avatar(
     db: DbSession,
@@ -244,12 +468,27 @@ def upload_account_avatar(
 ):
     content = image.file.read(5 * 1024 * 1024 + 1)
     try:
-        user.avatar_url = upload_public_image(content, image.content_type or "", f"avatars/{user.id}")
+        uploaded_url = upload_public_image(content, image.content_type or "", f"avatars/{user.id}")
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
     except RuntimeError:
         raise HTTPException(status_code=503, detail="头像存储服务未配置或暂时不可用") from None
-    db.commit()
+    previous_url = user.avatar_url
+    user.avatar_url = uploaded_url
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        try:
+            delete_public_image(uploaded_url)
+        except (RuntimeError, ValueError):
+            logger.warning("Unable to clean newly uploaded avatar after database failure for user_id=%s", user.id)
+        raise
+    if previous_url and previous_url != uploaded_url:
+        try:
+            delete_public_image(previous_url)
+        except (RuntimeError, ValueError):
+            logger.warning("Unable to clean replaced avatar for user_id=%s", user.id)
     db.refresh(user)
     return user
 
@@ -259,6 +498,7 @@ def change_account_password(payload: PasswordChange, db: DbSession, user: Curren
     if not verify_password(payload.current_password, user.password_hash):
         raise HTTPException(status_code=400, detail="当前密码不正确")
     user.password_hash = hash_password(payload.new_password)
+    user.token_version += 1
     db.commit()
 
 
@@ -268,11 +508,7 @@ def delete_account(payload: AccountDelete, db: DbSession, user: CurrentUser):
         raise HTTPException(status_code=403, detail="管理员账户不能通过此入口注销")
     if not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=400, detail="密码不正确")
-    if user.avatar_url:
-        try:
-            delete_public_image(user.avatar_url)
-        except (RuntimeError, ValueError):
-            raise HTTPException(status_code=502, detail="头像删除失败，请稍后重试") from None
+    avatar_url = user.avatar_url
 
     db.execute(delete(CartItem).where(CartItem.user_id == user.id))
     db.execute(delete(ProductFavorite).where(ProductFavorite.user_id == user.id))
@@ -288,9 +524,15 @@ def delete_account(payload: AccountDelete, db: DbSession, user: CurrentUser):
     user.email = f"deleted-{user.id}-{secrets.token_hex(4)}@deleted.invalid"
     user.password_hash = hash_password(secrets.token_urlsafe(32))
     user.role = "deleted"
+    user.token_version += 1
     user.display_name = None
     user.avatar_url = None
     db.commit()
+    if avatar_url:
+        try:
+            delete_public_image(avatar_url)
+        except (RuntimeError, ValueError):
+            logger.warning("Unable to clean account image after account deletion for user_id=%s", user.id)
 
 
 @app.get("/api/merchant/store", response_model=StoreRead)
@@ -642,37 +884,48 @@ def set_merchant_status(
     }
 
 
-@app.get("/api/admin/review-reports", response_model=list[AdminReviewReportRead])
+@app.get("/api/admin/review-reports", response_model=AdminReviewReportPageRead)
 def list_admin_review_reports(
     db: DbSession,
     _: AdminUser,
-    limit: int = Query(default=50, ge=1, le=100),
+    status_filter: Literal["open", "resolved", "dismissed"] | None = Query(default=None, alias="status"),
+    limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
 ):
+    filters = [ProductReviewReport.status == status_filter] if status_filter else []
+    total = db.scalar(
+        select(func.count()).select_from(ProductReviewReport).where(*filters)
+    ) or 0
     reports = db.scalars(
         select(ProductReviewReport)
         .options(
             selectinload(ProductReviewReport.review).selectinload(ProductReview.user),
             selectinload(ProductReviewReport.reporter),
         )
+        .where(*filters)
         .order_by(ProductReviewReport.created_at.desc(), ProductReviewReport.id.desc())
         .offset(offset)
         .limit(limit)
     )
-    return [
-        AdminReviewReportRead(
-            id=report.id,
-            review_id=report.review_id,
-            product_id=report.review.product_id,
-            product_name=report.review.product.name,
-            reporter_name=report.reporter.display_name or report.reporter.email,
-            reason=report.reason,
-            status=report.status,
-            review_content=report.review.content,
-            created_at=report.created_at,
-        )
-        for report in reports
-    ]
+    return AdminReviewReportPageRead(
+        items=[
+            AdminReviewReportRead(
+                id=report.id,
+                review_id=report.review_id,
+                product_id=report.review.product_id,
+                product_name=report.review.product.name,
+                reporter_name=report.reporter.display_name or report.reporter.email,
+                reason=report.reason,
+                status=report.status,
+                review_content=report.review.content,
+                created_at=report.created_at,
+            )
+            for report in reports
+        ],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @app.patch("/api/admin/review-reports/{report_id}", response_model=AdminReviewReportRead)
@@ -771,7 +1024,7 @@ def upload_product_image(
         raise HTTPException(status_code=404, detail="Product not found")
     content = image.file.read(5 * 1024 * 1024 + 1)
     try:
-        product.image_url = upload_public_image(
+        uploaded_url = upload_public_image(
             content,
             image.content_type or "",
             f"products/{product.seller_id or user.id}",
@@ -780,7 +1033,25 @@ def upload_product_image(
         raise HTTPException(status_code=422, detail=str(error)) from None
     except RuntimeError:
         raise HTTPException(status_code=503, detail="商品图片存储未配置或暂时不可用") from None
-    db.commit()
+    previous_url = product.image_url
+    product.image_url = uploaded_url
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        try:
+            delete_public_image(uploaded_url)
+        except (RuntimeError, ValueError):
+            logger.warning(
+                "Unable to clean newly uploaded product image after database failure for product_id=%s",
+                product_id,
+            )
+        raise
+    if previous_url and previous_url != uploaded_url:
+        try:
+            delete_public_image(previous_url)
+        except (RuntimeError, ValueError):
+            logger.warning("Unable to clean replaced product image for product_id=%s", product_id)
     db.refresh(product)
     return product
 
@@ -874,6 +1145,7 @@ def update_coupon(coupon_id: int, payload: CouponUpdate, db: DbSession, _: Admin
 
 @app.post("/api/orders", response_model=OrderRead, status_code=201)
 def checkout(payload: CheckoutInput, db: DbSession, user: CurrentUser):
+    expire_pending_orders(db)
     cart_items = list(
         db.scalars(
             select(CartItem)
@@ -914,6 +1186,8 @@ def checkout(payload: CheckoutInput, db: DbSession, user: CurrentUser):
     order = Order(
         user_id=user.id,
         status="pending_payment",
+        expires_at=datetime.now(timezone.utc)
+        + timedelta(minutes=get_settings().order_payment_expiry_minutes),
         subtotal=subtotal,
         discount=discount,
         total=money(subtotal - discount),
@@ -972,6 +1246,7 @@ def checkout(payload: CheckoutInput, db: DbSession, user: CurrentUser):
 
 @app.get("/api/orders", response_model=list[OrderRead])
 def list_orders(db: DbSession, user: CurrentUser):
+    expire_pending_orders(db)
     return list(
         db.scalars(
             select(Order)
@@ -1097,13 +1372,26 @@ def create_merchant_shipment(
     return merchant_order_data(fulfillment, email)
 
 
-@app.get("/api/admin/orders", response_model=list[AdminOrderRead])
+@app.get("/api/admin/orders", response_model=AdminOrderPageRead)
 def list_admin_orders(
     db: DbSession,
     _: AdminUser,
+    status_filter: Literal[
+        "pending_payment", "paid", "processing", "shipped", "delivered", "cancelled", "expired"
+    ] | None = Query(default=None, alias="status"),
+    search: str | None = Query(default=None, max_length=120),
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
 ):
+    expire_pending_orders(db)
+    filters = []
+    if status_filter is not None:
+        filters.append(Order.status == status_filter)
+    if search:
+        term = f"%{search.strip()}%"
+        filters.append(or_(User.email.ilike(term), cast(Order.id, String).ilike(term)))
+    base = select(Order.id).join(User, Order.user_id == User.id).where(*filters)
+    total = db.scalar(select(func.count()).select_from(base.subquery())) or 0
     rows = db.execute(
         select(Order, User.email)
         .join(User, Order.user_id == User.id)
@@ -1111,11 +1399,17 @@ def list_admin_orders(
             selectinload(Order.items),
             selectinload(Order.fulfillments).selectinload(MerchantFulfillment.seller).selectinload(User.store),
         )
+        .where(*filters)
         .order_by(Order.created_at.desc(), Order.id.desc())
         .offset(offset)
         .limit(limit)
     ).all()
-    return [admin_order_data(order, email) for order, email in rows]
+    return AdminOrderPageRead(
+        items=[admin_order_data(order, email) for order, email in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @app.post("/api/admin/orders/{order_id}/shipment", response_model=AdminOrderRead)

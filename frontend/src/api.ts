@@ -73,6 +73,13 @@ export interface AdminReviewReport {
   created_at: string
 }
 
+export interface AdminReviewReportPage {
+  items: AdminReviewReport[]
+  total: number
+  limit: number
+  offset: number
+}
+
 export interface CartLine {
   product_id: number
   product_name: string
@@ -100,6 +107,7 @@ export interface Order {
   discount: string
   total: string
   coupon_code: string | null
+  expires_at: string | null
   recipient_name: string | null
   recipient_phone: string | null
   shipping_region: string | null
@@ -143,6 +151,13 @@ export interface MerchantOrder {
 
 export interface AdminOrder extends Order {
   customer_email: string
+}
+
+export interface AdminOrderPage {
+  items: AdminOrder[]
+  total: number
+  limit: number
+  offset: number
 }
 
 export interface Coupon {
